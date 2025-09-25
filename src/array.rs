@@ -1,6 +1,6 @@
 use std::{ffi::c_void, fmt::Display, sync::Arc};
 
-use aligned_vec::{avec, avec_rt, AVec, ConstAlign};
+use aligned_vec::{avec, AVec, ConstAlign};
 use anyhow::{Context, Result};
 use ndarray::{ArrayViewD, ShapeBuilder};
 use numpy::{PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArray};
@@ -473,7 +473,7 @@ impl Tensor {
         ))
     }
 
-    pub(crate) fn buffer_info(&self) -> BufferInfo {
+    pub(crate) fn buffer_info<'a>(&'a self) -> BufferInfo<'a> {
         match &self.buffer {
             Buffer::Numba(buf) => BufferInfo {
                 ptr: buf.ptr,

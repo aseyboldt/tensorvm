@@ -17,7 +17,7 @@ pub use crate::{
 
 use pyo3::prelude::*;
 
-/// Python module for PyTensor-RT
+/// Python module for tensorvm
 #[pymodule]
 fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add graph building classes

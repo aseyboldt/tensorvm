@@ -2,9 +2,10 @@ use std::fmt::{Debug, Display};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use pytensor_rt::{
+use tensorvm::{
     DType, DynInstruction, Error, ExecutionContext, Instruction, ModuleBuilder, NumbaRuntime,
-    Order, RayonExecutionContext, Tensor, TensorType, Value, ValueStore, ValueType, Variable,
+    Order, RayonExecutionContext, Tensor, TensorType, Value, ValueId, ValueStore, ValueType,
+    Variable,
 };
 
 const N: usize = 4;
@@ -356,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     values.set_input(function_id, 2, Value::Tensor(shape_tensor));
 
     // Set the condition global variable
-    if let pytensor_rt::ValueId::Global(global_id) = condition_id {
+    if let ValueId::Global(global_id) = condition_id {
         values.set_global(global_id, Value::Tensor(condition_tensor));
     }
 

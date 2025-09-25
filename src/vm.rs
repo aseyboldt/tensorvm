@@ -1573,7 +1573,7 @@ mod tests {
         let mut main_region = function_builder.create_region(module_builder.clone());
 
         // Add allocation for output
-        let alloc_node = main_region.add_alloc(
+        main_region.add_alloc(
             output_array_id,
             function_builder.input(1).unwrap(), // shape input
             TensorType {
