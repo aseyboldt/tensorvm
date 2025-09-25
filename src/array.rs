@@ -1,5 +1,6 @@
 use std::{ffi::c_void, fmt::Display, sync::Arc};
 
+use aligned_vec::{avec, avec_rt, AVec, ConstAlign};
 use anyhow::{Context, Result};
 use ndarray::{ArrayViewD, ShapeBuilder};
 use numpy::{PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArray};
@@ -125,7 +126,7 @@ impl Drop for NumbaBuffer {
 
 #[derive(Debug)]
 pub struct NativeBuffer {
-    data: Vec<u8>,
+    data: AVec<u8, ConstAlign<256>>,
     byte_strides: Strides,
     offset: usize,
 }
@@ -142,14 +143,13 @@ impl NativeBuffer {
             acc.checked_mul(dim)
                 .expect("Shape dimensions overflow when calculating item count")
         });
+        let capacity = item_count
+            .checked_mul(dtype.size_bytes())
+            .expect("nbytes overflow");
+        // DLpack uses 256-byte alignment for its arrays
+        let data = avec![[256] | 0u8; capacity];
         Self {
-            data: vec![
-                0u8;
-                dtype
-                    .size_bytes()
-                    .checked_mul(item_count)
-                    .expect("nbytes overflow")
-            ],
+            data,
             byte_strides: calculate_strides_for_new_array(shape, dtype.size_bytes(), order),
             offset: 0,
         }

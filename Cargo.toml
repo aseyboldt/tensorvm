@@ -9,6 +9,7 @@ name = "pytensor_rt"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+aligned-vec = "0.6.4"
 anyhow = "1.0.99"
 crossbeam-utils = "0.8.21"
 itertools = "0.14.0"
