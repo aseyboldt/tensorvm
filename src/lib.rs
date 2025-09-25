@@ -1,10 +1,27 @@
 mod array;
 mod ffi;
-mod python_bindings;
+mod python_vm;
 mod vm;
+//mod python_bindings;
+//mod vm;
 
 pub use crate::{
-    array::{Array, Buffer, DType, Order, Shape},
+    array::{Buffer, DType, Order, Shape, Tensor, TensorType},
     ffi::{CallCommandArg, ExternalArrayFunc, NumbaRuntime},
-    vm::{Alloc, Command, CommandWithVariables, ExternalCall, Variable, VM},
+    vm::{
+        ExecutionContext, FunctionBuilder, GlobalValueId, Instruction, Module, ModuleBuilder,
+        NodeId, RayonExecutionContext, RayonValueStore, Region, RegionBuilder, RegionId, ValueId,
+        ValueStore, ValueType, Variable,
+    },
 };
+
+use pyo3::prelude::*;
+
+/// Python module for PyTensor-RT
+#[pymodule]
+fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Add graph building classes
+    python_vm::create_python_module(py, m)?;
+
+    Ok(())
+}

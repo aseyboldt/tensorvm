@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, fmt::Display, sync::Arc};
 
 use anyhow::{Context, Result};
 use ndarray::{ArrayViewD, ShapeBuilder};
@@ -14,34 +14,68 @@ const INLINE_SIZE: usize = 4;
 pub type Shape = SmallVec<[usize; INLINE_SIZE]>;
 pub type Strides = SmallVec<[usize; INLINE_SIZE]>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Order(ndarray::Order);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Order {
+    RowMajor,
+    ColumnMajor,
+    Arbitrary,
+}
 
 impl Order {
     pub fn from_string(s: &str) -> Result<Self> {
         match s {
-            "C" | "c" => Ok(Self(ndarray::Order::RowMajor)),
-            "F" | "f" => Ok(Self(ndarray::Order::ColumnMajor)),
+            "C" | "c" => Ok(Self::RowMajor),
+            "F" | "f" => Ok(Self::ColumnMajor),
+            "A" | "a" => Ok(Self::Arbitrary),
             _ => anyhow::bail!("Unknown order string: {}", s),
         }
     }
 
     pub fn c() -> Self {
-        Self(ndarray::Order::RowMajor)
+        Self::RowMajor
     }
 
     pub fn f() -> Self {
-        Self(ndarray::Order::ColumnMajor)
+        Self::ColumnMajor
     }
 
     pub fn to_string(&self) -> String {
-        match self.0 {
-            ndarray::Order::RowMajor => "C",
-            ndarray::Order::ColumnMajor => "F",
-            _ => "Unknown",
+        match self {
+            Order::RowMajor => "C",
+            Order::ColumnMajor => "F",
+            Order::Arbitrary => "A",
         }
         .to_owned()
     }
+}
+
+impl From<ndarray::Order> for Order {
+    fn from(value: ndarray::Order) -> Self {
+        match value {
+            ndarray::Order::RowMajor => Order::RowMajor,
+            ndarray::Order::ColumnMajor => Order::ColumnMajor,
+            _ => Order::Arbitrary,
+        }
+    }
+}
+
+impl TryInto<ndarray::Order> for Order {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<ndarray::Order, Self::Error> {
+        match self {
+            Order::RowMajor => Ok(ndarray::Order::RowMajor),
+            Order::ColumnMajor => Ok(ndarray::Order::ColumnMajor),
+            Order::Arbitrary => anyhow::bail!("Cannot convert Arbitrary order to ndarray::Order"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub struct TensorType {
+    pub rank: usize,
+    pub dtype: DType,
+    pub order: Order,
 }
 
 #[derive(Debug)]
@@ -55,6 +89,10 @@ pub struct NumbaBuffer {
     byte_strides: Strides,
     numba_runtime: Arc<NumbaRuntime>,
 }
+
+// SAFETY: NumbaBuffer can be sent between threads
+// because NRT_MemInfo is thread-safe.
+unsafe impl Send for NumbaBuffer {}
 
 impl NumbaBuffer {
     pub(crate) fn from_buffer_info(
@@ -112,13 +150,13 @@ impl NativeBuffer {
                     .checked_mul(item_count)
                     .expect("nbytes overflow")
             ],
-            byte_strides: calculate_strides(shape, dtype.size_bytes(), order),
+            byte_strides: calculate_strides_for_new_array(shape, dtype.size_bytes(), order),
             offset: 0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     F64,
     F32,
@@ -131,6 +169,25 @@ pub enum DType {
     U8,
     I8,
     Bool,
+}
+
+impl Display for DType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DType::F64 => "float64",
+            DType::F32 => "float32",
+            DType::U64 => "uint64",
+            DType::I64 => "int64",
+            DType::U32 => "uint32",
+            DType::I32 => "int32",
+            DType::U16 => "uint16",
+            DType::I16 => "int16",
+            DType::U8 => "uint8",
+            DType::I8 => "int8",
+            DType::Bool => "bool",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 pub trait PrimitiveAsDType {
@@ -200,11 +257,16 @@ impl DType {
     pub fn from_string(s: &str) -> Option<Self> {
         match s {
             "float64" | "f64" => Some(DType::F64),
-            "int64" | "i64" => Some(DType::I64),
-            "bool" => Some(DType::Bool),
             "float32" | "f32" => Some(DType::F32),
+            "int64" | "i64" => Some(DType::I64),
+            "uint64" | "u64" => Some(DType::U64),
             "int32" | "i32" => Some(DType::I32),
+            "uint32" | "u32" => Some(DType::U32),
+            "int16" | "i16" => Some(DType::I16),
+            "uint16" | "u16" => Some(DType::U16),
+            "int8" | "i8" => Some(DType::I8),
             "uint8" | "u8" => Some(DType::U8),
+            "bool" => Some(DType::Bool),
             _ => None,
         }
     }
@@ -281,14 +343,15 @@ impl Buffer {
     }
 }
 
-pub struct Array {
+#[derive(Debug)]
+pub struct Tensor {
     pub(crate) buffer: Buffer,
     pub(crate) shape: Shape,
     pub(crate) dtype: DType,
 }
 
 /// Conversion to ndarray views
-impl Array {
+impl Tensor {
     pub fn as_array_view<'a, T: PrimitiveAsDType>(
         &'a self,
     ) -> Result<Option<ndarray::ArrayView<'a, T, ndarray::IxDyn>>> {
@@ -451,7 +514,7 @@ impl Array {
         order: Order,
     ) -> Result<Self> {
         // Create a new buffer and copy data over
-        let mut array = Array::new(T::dtype(), values.shape(), order);
+        let mut array = Tensor::new(T::dtype(), values.shape(), order);
         let mut array_view = array
             .as_array_view_mut::<T>()
             .context("Failed to create array view of variable")?
@@ -460,7 +523,7 @@ impl Array {
         Ok(array)
     }
 
-    fn new(dtype: DType, shape: &[usize], order: Order) -> Self {
+    pub fn new(dtype: DType, shape: &[usize], order: Order) -> Self {
         let buffer = NativeBuffer::new(dtype, shape, order);
         Self {
             buffer: Buffer::Native(buffer),
@@ -468,10 +531,18 @@ impl Array {
             dtype,
         }
     }
+
+    pub(crate) fn as_scalar_bool(&self) -> Result<bool> {
+        todo!()
+    }
+
+    pub(crate) fn as_shape(&self) -> Result<Shape> {
+        todo!()
+    }
 }
 
 // Helper function to calculate byte strides for a new array with given shape and order
-fn calculate_strides(shape: &[usize], element_size: usize, order: Order) -> Strides {
+fn calculate_strides_for_new_array(shape: &[usize], element_size: usize, order: Order) -> Strides {
     let ndim = shape.len();
     let mut strides: Strides = SmallVec::with_capacity(ndim);
 
@@ -482,9 +553,9 @@ fn calculate_strides(shape: &[usize], element_size: usize, order: Order) -> Stri
     // Initialize with correct length
     strides.resize(ndim, 0);
 
-    match order.0 {
+    match order {
         // Row-major (C-order): last axis is contiguous; base stride is element_size in bytes
-        ndarray::Order::RowMajor => {
+        Order::RowMajor | Order::Arbitrary => {
             strides[ndim - 1] = element_size;
             for i in (0..ndim - 1).rev() {
                 strides[i] = strides[i + 1]
@@ -493,16 +564,13 @@ fn calculate_strides(shape: &[usize], element_size: usize, order: Order) -> Stri
             }
         }
         // Column-major (F-order): first axis is contiguous; base stride is element_size in bytes
-        ndarray::Order::ColumnMajor => {
+        Order::ColumnMajor => {
             strides[0] = element_size;
             for i in 1..ndim {
                 strides[i] = strides[i - 1]
                     .checked_mul(shape[i - 1])
                     .expect("Overflow in stride calculation");
             }
-        }
-        _ => {
-            panic!("Unsupported order")
         }
     }
 

@@ -58,7 +58,7 @@ pub struct CallCommandArg<'buffer> {
     _phantom: std::marker::PhantomData<&'buffer ()>,
 }
 
-pub struct CArgBuffer {
+pub struct ExternalCallBuffer {
     buffers: Vec<*mut c_void>,
     meminfo: Vec<*mut NRT_MemInfo>,
     // Pointer to an array of nbytes of the buffers
@@ -74,7 +74,7 @@ pub struct CArgBuffer {
     dtypes: Vec<u8>,
 }
 
-impl CArgBuffer {
+impl ExternalCallBuffer {
     pub fn clear(&mut self) {
         let Self {
             buffers,
@@ -160,7 +160,7 @@ impl CArgBuffer {
         })
     }
 
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             buffers: Vec::new(),
             meminfo: Vec::new(),
@@ -211,7 +211,7 @@ impl BufferInfo<'_> {
 /// - It must not free any modified buffers. The caller
 ///   will take care of that.
 /// - If it returns an error code, it must not modify any buffers.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExternalArrayFunc {
     func_ptr: CallCommandFn,
 }
@@ -225,7 +225,7 @@ impl ExternalArrayFunc {
     ///
     /// On success, returns the number of modified buffers.
     /// On failure, returns an error code.
-    pub fn call(&self, args: &mut CArgBuffer) -> Result<usize, i64> {
+    pub fn call(&self, args: &mut ExternalCallBuffer) -> Result<usize, i64> {
         let ret = (self.func_ptr)(
             args.buffers.len(),
             args.buffers.as_mut_ptr(),

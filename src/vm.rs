@@ -1,225 +1,1539 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
-
-use anyhow::Result;
-use pyo3::{Py, PyAny, Python};
-
-use crate::{
-    array::{Array, Buffer, DType, NativeBuffer, Order, Shape},
-    ffi::{CArgBuffer, ExternalArrayFunc, NumbaRuntime},
+use std::{
+    cell::RefCell,
+    fmt::{Debug, Display},
+    ops::{Deref, DerefMut},
+    sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
-pub enum VariableType {
-    Array(Array),
+use crossbeam_utils::CachePadded;
+use itertools::Itertools;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use smallvec::SmallVec;
+use thiserror::Error;
+
+use crate::{
+    array::TensorType, ffi::ExternalCallBuffer, Buffer, ExternalArrayFunc, NumbaRuntime, Tensor,
+};
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("External function call failed: {message}")]
+    ExternalError { message: String },
+
+    #[error("Invalid graph: {kind}")]
+    InvalidGraphError { kind: InvalidGraphKind },
+
+    #[error("Value error: {message}")]
+    ValueError { message: String },
+
+    #[error("Tensor operation failed: {0}")]
+    TensorError(#[from] anyhow::Error),
 }
 
-pub type Variable = Rc<RefCell<VariableType>>;
+#[derive(Error, Debug)]
+pub enum InvalidGraphKind {
+    #[error(
+        "Wrong number of arguments: instruction '{instruction}' expected {expected}, got {actual}"
+    )]
+    WrongArgumentCount {
+        instruction: String,
+        expected: usize,
+        actual: usize,
+    },
 
-#[derive(Clone, Debug)]
-pub struct Alloc {
-    shape: Shape,
-    dtype: DType,
-    order: Order,
+    #[error("Empty value in {context}")]
+    EmptyValue { context: String },
+
+    #[error("Invalid value type in {context}")]
+    InvalidValueType { context: String },
 }
 
-impl Alloc {
-    pub fn new(shape: Shape, dtype: DType, order: Order) -> Self {
-        Self {
-            shape,
-            dtype,
-            order,
+pub type Result<T> = std::result::Result<T, Error>;
+
+thread_local! {
+    static EXTERNAL_CALL_BUFFER: RefCell<ExternalCallBuffer> = const { RefCell::new(ExternalCallBuffer::new()) };
+}
+
+#[derive(Debug)]
+pub enum Value {
+    Tensor(Tensor),
+    Empty,
+}
+
+impl Value {
+    fn as_scalar_bool(&self) -> Result<bool> {
+        match self {
+            Value::Tensor(t) => Ok(t.as_scalar_bool()?),
+            Value::Empty => Err(Error::ValueError {
+                message: "Value is empty".to_string(),
+            }),
         }
     }
 }
 
-impl CommandTrait for Alloc {
-    fn execute(
-        &self,
-        _vm: &VM,
-        _c_arg_buffer: &mut CArgBuffer,
-        variables: &mut [Variable],
-    ) -> Result<()> {
-        for variable in variables.iter() {
-            let mut var_borrow = variable.borrow_mut();
-            let dtype = self.dtype;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlobalValueId(usize);
 
-            let item_count = self.shape.iter().fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim)
-                    .expect("Shape dimensions overflow when calculating item count")
-            });
-            let _nbytes = item_count
-                .checked_mul(dtype.size_bytes())
-                .expect("nbytes overflow");
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueId {
+    Input(FunctionId, usize),
+    Output(FunctionId, usize),
+    Global(GlobalValueId),
+}
 
-            match &mut *var_borrow {
-                VariableType::Array(array) => {
-                    match &mut array.buffer {
-                        Buffer::Empty => {}
-                        Buffer::Native(_buffer) => {
-                            if array.dtype == dtype {
-                                // TODO: We can reuse the buffer if it has enough bytes
-                                //buffer.resize(&self.shape, self.order);
-                                //continue;
-                            }
-                        }
-                        Buffer::Numba(_buffer) => {
-                            // TODO: We can reuse the buffer if it has enough bytes
-                            //if buffer.dtype == dtype && buffer.nbytes == nbytes {
-                            //    buffer.reset(&self.shape, self.order);
-                            //    continue;
-                            //}
-                        }
-                    };
+#[derive(Debug, Clone)]
+pub enum ValueType {
+    Tensor(TensorType),
+    // Could add other types later like Counter, Bool, etc.
+}
 
-                    // TODO: wrap in a function in Array
-                    let buffer = NativeBuffer::new(dtype, self.shape.as_slice(), self.order);
-                    array.buffer = Buffer::Native(buffer);
-                    array.shape.clear();
-                    array.shape.extend_from_slice(&self.shape);
-                }
-            }
-        }
+#[derive(Debug, Clone)]
+pub struct Variable {
+    pub value_type: ValueType,
+    pub name: Option<String>,
+}
 
-        Ok(())
+impl Variable {
+    pub fn new(value_type: ValueType, name: Option<String>) -> Self {
+        Self { value_type, name }
     }
 }
+
+#[derive(Debug)]
+struct Node {
+    args: Vec<ValueId>,
+    successors: Vec<NodeId>,
+    predecessors: Vec<NodeId>,
+    instruction: Instruction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(usize);
+
+impl Node {
+    fn run<C: ExecutionContext>(&self, ctx: &C, store: &C::ValueStore) -> Result<()> {
+        self.instruction.run(ctx, store, &self.args)
+    }
+}
+
+#[derive(Debug)]
+pub struct Region {
+    nodes: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionId(usize);
 
 pub struct ExternalCall {
-    external_fn: ExternalArrayFunc,
-    keep_alive: Option<Py<PyAny>>,
+    func: ExternalArrayFunc,
+    _keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
+    args: Vec<ValueId>,
+    arg_is_mut: Vec<bool>,
+    name: String,
 }
 
-impl Clone for ExternalCall {
-    fn clone(&self) -> Self {
-        let keep_alive = self
-            .keep_alive
-            .as_ref()
-            .map(|py_any| Python::attach(|py| py_any.clone_ref(py)));
-
-        Self {
-            external_fn: self.external_fn.clone(),
-            keep_alive,
-        }
+impl Debug for ExternalCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalCall")
+            .field("func", &self.func)
+            .field("args", &self.args)
+            .field("arg_is_mut", &self.arg_is_mut)
+            .field("name", &self.name)
+            .finish()
     }
 }
 
-impl ExternalCall {
-    pub fn new(external_fn: ExternalArrayFunc, keep_alive: Option<Py<PyAny>>) -> Self {
-        Self {
-            external_fn,
-            keep_alive,
-        }
-    }
-}
+// SAFETY: ExternalCall can be sent between threads as long as the function pointer and
+// keep_alive are Send + Sync.
+// We require the function pointer passed by upstream libraries to be Send.
+unsafe impl Send for ExternalCall {}
 
-impl CommandTrait for ExternalCall {
-    fn execute(
+impl RunInstruction for ExternalCall {
+    fn run<C: ExecutionContext>(
         &self,
-        vm: &VM,
-        c_arg_buffer: &mut CArgBuffer,
-        variables: &mut [Variable],
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
     ) -> Result<()> {
-        c_arg_buffer.clear();
-
-        // Add all variables to the command buffer
-        for variable in variables.iter() {
-            match &*variable.borrow() {
-                VariableType::Array(array) => {
-                    c_arg_buffer.push_buffer_from_info(array.buffer_info());
-                }
-            }
+        if args.len() != self.args.len() {
+            return Err(Error::InvalidGraphError {
+                kind: InvalidGraphKind::WrongArgumentCount {
+                    instruction: format!("ExternalCall({})", self.name),
+                    expected: self.args.len(),
+                    actual: args.len(),
+                },
+            });
         }
+        EXTERNAL_CALL_BUFFER.with_borrow_mut(|c_arg_buffer| {
+            c_arg_buffer.clear();
 
-        self.external_fn.call(c_arg_buffer).map_err(|e| {
-            anyhow::anyhow!("Error calling external function pointer: {}", e.to_string())
-        })?;
-
-        // Iterate over modified buffers and update the corresponding variables
-        // All modified buffers are guaranteed to be NumbaBuffers.
-        variables
-            .iter()
-            .zip(c_arg_buffer.buffers())
-            .for_each(|(variable, buffer_info)| {
-                if buffer_info.is_modified() {
-                    let mut var_borrow = variable.borrow_mut();
-                    match &mut *var_borrow {
-                        VariableType::Array(array) => {
-                            array.buffer =
-                                Buffer::Numba(buffer_info.to_buffer(vm.numba_runtime.clone()));
+            let mut vals_mut: SmallVec<[_; 8]> = SmallVec::new();
+            let mut vals: SmallVec<[_; 8]> = SmallVec::new();
+            for (&arg_id, &is_mut) in args.iter().zip_eq(self.arg_is_mut.iter()) {
+                if is_mut {
+                    let val = store.resolve_value_mut(arg_id);
+                    match &*val {
+                        Value::Tensor(tensor) => {
+                            let info = tensor.buffer_info();
+                            c_arg_buffer.push_buffer_from_info(info);
+                        }
+                        Value::Empty => {
+                            return Err(Error::InvalidGraphError {
+                                kind: InvalidGraphKind::EmptyValue {
+                                    context: "mutable argument in external call".to_string(),
+                                },
+                            });
                         }
                     }
+                    vals_mut.push(val);
+                } else {
+                    let val = store.resolve_value(arg_id);
+                    match &*val {
+                        Value::Tensor(tensor) => {
+                            let info = tensor.buffer_info();
+                            c_arg_buffer.push_buffer_from_info(info);
+                        }
+                        Value::Empty => {
+                            return Err(Error::InvalidGraphError {
+                                kind: InvalidGraphKind::EmptyValue {
+                                    context: "immutable argument in external call".to_string(),
+                                },
+                            });
+                        }
+                    }
+                    vals.push(val);
                 }
-            });
+            }
+            let _ = self
+                .func
+                .call(c_arg_buffer)
+                .map_err(|e| Error::ExternalError {
+                    message: format!("Error calling external function pointer: {}", e),
+                })?;
 
+            let mut modified_idx = 0;
+            for (buffer_info, &is_mut) in c_arg_buffer.buffers().zip_eq(self.arg_is_mut.iter()) {
+                if is_mut {
+                    let val = &mut vals_mut[modified_idx];
+                    modified_idx += 1;
+                    match val.deref_mut() {
+                        Value::Tensor(tensor) => {
+                            tensor.buffer =
+                                Buffer::Numba(buffer_info.to_buffer(ctx.numba_runtime().clone()))
+                        }
+                        Value::Empty => {
+                            return Err(Error::InvalidGraphError {
+                                kind: InvalidGraphKind::EmptyValue {
+                                    context: "mutable argument was empty in external call"
+                                        .to_string(),
+                                },
+                            });
+                        }
+                    }
+                } else {
+                    if buffer_info.is_modified() {
+                        panic!("Immutable argument was modified by external function");
+                    }
+                }
+            }
+
+            // This might unlock the values
+            drop(vals_mut);
+            drop(vals);
+            Ok(())
+        })
+    }
+}
+
+// Takes two arguments: target and shape
+#[derive(Debug)]
+pub struct Alloc {
+    tensor_type: TensorType,
+}
+
+impl RunInstruction for Alloc {
+    fn run<C: ExecutionContext>(
+        &self,
+        _ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
+    ) -> Result<()> {
+        if args.len() != 2 {
+            return Err(Error::InvalidGraphError {
+                kind: InvalidGraphKind::WrongArgumentCount {
+                    instruction: "Alloc".to_string(),
+                    expected: 2,
+                    actual: args.len(),
+                },
+            });
+        }
+        let shape_value = store.resolve_value(args[1]);
+        let shape = match &*shape_value {
+            Value::Tensor(t) => t.as_shape()?,
+            Value::Empty => {
+                return Err(Error::InvalidGraphError {
+                    kind: InvalidGraphKind::EmptyValue {
+                        context: "shape argument in Alloc".to_string(),
+                    },
+                });
+            }
+        };
+        let tensor = Tensor::new(
+            self.tensor_type.dtype,
+            shape.as_slice(),
+            self.tensor_type.order,
+        );
+        let mut target_value = store.resolve_value_mut(args[0]);
+        *target_value = Value::Tensor(tensor);
         Ok(())
     }
 }
 
-/// A Command modifies the variables in some way.
-/// It can allocate new buffers, reshape existing ones,
-/// or call a function pointer with the buffers as arguments.
-///
-/// The caller of the VM is responsible for ensuring
-/// that the commands are valid, and that the variables
-/// are correctly set up, and memory is not reused in an
-/// invalid way.
-pub trait CommandTrait: Clone {
-    fn execute(
+#[derive(Debug)]
+pub struct If {
+    then_branch: RegionId,
+    else_branch: RegionId,
+}
+
+impl RunInstruction for If {
+    fn run<C: ExecutionContext>(
         &self,
-        vm: &VM,
-        c_arg_buffer: &mut CArgBuffer,
-        variables: &mut [Variable],
-    ) -> Result<()>;
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
+    ) -> Result<()> {
+        if args.len() != 1 {
+            return Err(Error::InvalidGraphError {
+                kind: InvalidGraphKind::WrongArgumentCount {
+                    instruction: "If".to_string(),
+                    expected: 1,
+                    actual: args.len(),
+                },
+            });
+        }
+        let cond_value = store.resolve_value(args[0]);
+        let cond = cond_value.as_scalar_bool()?;
+        if cond {
+            ctx.run_region(self.then_branch, store)
+        } else {
+            ctx.run_region(self.else_branch, store)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct While {
+    cond: RegionId,
+    body: RegionId,
+}
+
+impl RunInstruction for While {
+    fn run<C: ExecutionContext>(
+        &self,
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
+    ) -> Result<()> {
+        if args.len() != 1 {
+            return Err(Error::InvalidGraphError {
+                kind: InvalidGraphKind::WrongArgumentCount {
+                    instruction: "While".to_string(),
+                    expected: 1,
+                    actual: args.len(),
+                },
+            });
+        }
+        loop {
+            ctx.run_region(self.cond, store)?;
+            let cond_value = store.resolve_value(args[0]);
+            let cond = cond_value.as_scalar_bool()?;
+            if !cond {
+                break;
+            }
+            ctx.run_region(self.body, store)?;
+        }
+        Ok(())
+    }
 }
 
 #[non_exhaustive]
-#[derive(Clone)]
-pub enum Command {
-    Alloc(Alloc),
+#[derive(Debug)]
+pub enum Instruction {
+    If(If),
+    While(While),
     ExternalCall(ExternalCall),
+    Alloc(Alloc),
 }
 
-impl CommandTrait for Command {
-    fn execute(
+impl Instruction {
+    fn run<C: ExecutionContext>(
         &self,
-        vm: &VM,
-        c_arg_buffer: &mut CArgBuffer,
-        variables: &mut [Variable],
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
     ) -> Result<()> {
         match self {
-            Command::Alloc(alloc) => alloc.execute(vm, c_arg_buffer, variables),
-            Command::ExternalCall(call_func_ptr) => {
-                call_func_ptr.execute(vm, c_arg_buffer, variables)
+            Instruction::If(i) => i.run(ctx, store, args),
+            Instruction::While(i) => i.run(ctx, store, args),
+            Instruction::ExternalCall(i) => i.run(ctx, store, args),
+            Instruction::Alloc(i) => i.run(ctx, store, args),
+        }
+    }
+
+    pub fn if_(then_branch: RegionId, else_branch: RegionId) -> Self {
+        Instruction::If(If {
+            then_branch,
+            else_branch,
+        })
+    }
+
+    pub fn while_(cond: RegionId, body: RegionId) -> Self {
+        Instruction::While(While { cond, body })
+    }
+
+    pub fn external_call(
+        func: ExternalArrayFunc,
+        keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
+        args: Vec<ValueId>,
+        arg_is_mut: Vec<bool>,
+        name: String,
+    ) -> Self {
+        Instruction::ExternalCall(ExternalCall {
+            func,
+            keep_alive,
+            args,
+            arg_is_mut,
+            name,
+        })
+    }
+
+    pub fn alloc(tensor_type: TensorType) -> Self {
+        Instruction::Alloc(Alloc { tensor_type })
+    }
+}
+
+trait RunInstruction {
+    fn run<C: ExecutionContext>(
+        &self,
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
+    ) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionId(usize);
+
+#[derive(Debug)]
+pub struct Function {
+    entry: RegionId,
+    name: String,
+    id: FunctionId,
+    input_variables: Vec<Variable>,
+    output_variables: Vec<Variable>,
+}
+
+#[derive(Debug)]
+pub struct Module {
+    regions: Vec<Region>,
+    nodes: Vec<Node>,
+    functions: Vec<Function>,
+    globals: Vec<Variable>,
+}
+
+impl Module {
+    fn resolve_region(&self, region_id: RegionId) -> &Region {
+        &self.regions[region_id.0]
+    }
+
+    fn resolve_node(&self, node_id: NodeId) -> &Node {
+        &self.nodes[node_id.0]
+    }
+
+    fn resolve_function(&self, function_id: FunctionId) -> &Function {
+        &self.functions[function_id.0]
+    }
+
+    pub fn resolve_global(&self, global_id: GlobalValueId) -> &Variable {
+        &self.globals[global_id.0]
+    }
+
+    fn resolve_input_variable(&self, func_id: FunctionId, index: usize) -> &Variable {
+        &self.functions[func_id.0].input_variables[index]
+    }
+
+    fn resolve_output_variable(&self, func_id: FunctionId, index: usize) -> &Variable {
+        &self.functions[func_id.0].output_variables[index]
+    }
+
+    pub fn resolve_variable(&self, value_id: ValueId) -> &Variable {
+        match value_id {
+            ValueId::Input(func_id, idx) => self.resolve_input_variable(func_id, idx),
+            ValueId::Output(func_id, idx) => self.resolve_output_variable(func_id, idx),
+            ValueId::Global(global_id) => self.resolve_global(global_id),
+        }
+    }
+
+    /// Resolve the type of a value in the context of a specific function
+    pub fn resolve_value_type(&self, value_id: ValueId) -> &ValueType {
+        match value_id {
+            ValueId::Input(func_id, idx) => {
+                &self
+                    .resolve_function(func_id)
+                    .input_variables
+                    .get(idx)
+                    .expect("Input index out of bounds")
+                    .value_type
+            }
+            ValueId::Output(func_id, idx) => {
+                &self
+                    .resolve_function(func_id)
+                    .output_variables
+                    .get(idx)
+                    .expect("Output index out of bounds")
+                    .value_type
+            }
+            ValueId::Global(GlobalValueId(idx)) => {
+                &self
+                    .globals
+                    .get(idx)
+                    .expect("Global variable index out of bounds")
+                    .value_type
             }
         }
     }
+
+    /// Get the number of regions (for Python bindings)
+    pub fn num_regions(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Get the number of nodes (for Python bindings)
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn num_functions(&self) -> usize {
+        self.functions.len()
+    }
+
+    pub fn num_variables(&self) -> usize {
+        self.globals.len()
+    }
 }
 
-pub struct CommandWithVariables {
-    pub command: Command,
-    pub variables: Vec<Variable>,
+impl Display for Module {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "; Module: example.prt")?;
+        writeln!(f)?;
+
+        // Write global value declarations
+        writeln!(f, "; Global Value declarations with optional names")?;
+        for (i, variable) in self.globals.iter().enumerate() {
+            if let Some(name) = &variable.name {
+                write!(f, "%v_{}: ", name)?;
+            } else {
+                write!(f, "%v{}: ", i)?;
+            }
+
+            match &variable.value_type {
+                ValueType::Tensor(tensor_type) => {
+                    write!(f, "{}", format_tensor_type(tensor_type))?;
+                }
+            }
+            writeln!(f)?;
+        }
+        writeln!(f)?;
+
+        // Write function comments
+        writeln!(
+            f,
+            "; %c* values represent control flow, they order the operations"
+        )?;
+        writeln!(f, "; %v* values represent storage locations (variables)")?;
+        writeln!(f, "; %i* values represent inputs to the function")?;
+        writeln!(f, "; %o* values represent outputs of the function")?;
+
+        // Write functions
+        for function in &self.functions {
+            write!(f, "fn {}(", function.name)?;
+
+            // Write inputs
+            let mut first = true;
+            for (idx, input_var) in function.input_variables.iter().enumerate() {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
+                write!(f, "%i{}: ", idx)?;
+                match &input_var.value_type {
+                    ValueType::Tensor(tensor_type) => {
+                        write!(f, "{}", format_tensor_type(tensor_type))?;
+                    }
+                }
+            }
+
+            write!(f, ") -> (")?;
+
+            // Write outputs
+            let mut first = true;
+            for (idx, output_var) in function.output_variables.iter().enumerate() {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
+                write!(f, "%o{}: ", idx)?;
+                match &output_var.value_type {
+                    ValueType::Tensor(tensor_type) => {
+                        write!(f, "{}", format_tensor_type(tensor_type))?;
+                    }
+                }
+            }
+
+            writeln!(f, ") {{")?;
+
+            let region = self.resolve_region(function.entry);
+            self.format_region(f, region, 1)?;
+
+            writeln!(f, "}}")?;
+            writeln!(f)?;
+        }
+
+        Ok(())
+    }
 }
 
-pub struct VM {
-    numba_runtime: Arc<NumbaRuntime>,
-    commands: Vec<CommandWithVariables>,
+impl Module {
+    fn format_region(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        region: &Region,
+        indent_level: usize,
+    ) -> std::fmt::Result {
+        let indent = "    ".repeat(indent_level);
+
+        for (i, &node_id) in region.nodes.iter().enumerate() {
+            let node = self.resolve_node(node_id);
+            write!(f, "{}%c{} = ", indent, i)?;
+
+            match &node.instruction {
+                Instruction::Alloc(_) => {
+                    write!(f, "Alloc(")?;
+                    if !node.predecessors.is_empty() {
+                        // Find the predecessor control value
+                        let pred_idx = region
+                            .nodes
+                            .iter()
+                            .position(|&nid| nid == node.predecessors[0])
+                            .unwrap_or(0);
+                        write!(f, "%c{}; ", pred_idx)?;
+                    }
+                    write!(f, "target=")?;
+                    self.format_value_id(f, node.args[0])?;
+                    write!(f, ", shape=")?;
+                    self.format_value_id(f, node.args[1])?;
+                    write!(f, ")")?;
+                }
+                Instruction::ExternalCall(call) => {
+                    write!(f, "ExternalCall(")?;
+                    if !node.predecessors.is_empty() {
+                        // Find the predecessor control value
+                        let pred_idx = region
+                            .nodes
+                            .iter()
+                            .position(|&nid| nid == node.predecessors[0])
+                            .unwrap_or(0);
+                        write!(f, "%c{}; ", pred_idx)?;
+                    }
+                    write!(f, "\"{}\"", call.name)?;
+                    for (j, &arg) in node.args.iter().enumerate() {
+                        write!(f, ", ")?;
+                        if call.arg_is_mut[j] {
+                            write!(f, "mut ")?;
+                        }
+                        self.format_value_id(f, arg)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Instruction::If(if_instr) => {
+                    write!(f, "If(")?;
+                    if !node.predecessors.is_empty() {
+                        // Find the predecessor control value
+                        let pred_idx = region
+                            .nodes
+                            .iter()
+                            .position(|&nid| nid == node.predecessors[0])
+                            .unwrap_or(0);
+                        write!(f, "%c{}; ", pred_idx)?;
+                    }
+                    write!(f, "condition=")?;
+                    self.format_value_id(f, node.args[0])?;
+                    writeln!(f, ") then {{")?;
+
+                    let then_region = self.resolve_region(if_instr.then_branch);
+                    self.format_region(f, then_region, indent_level + 1)?;
+
+                    writeln!(f, "{}}} else {{", indent)?;
+
+                    let else_region = self.resolve_region(if_instr.else_branch);
+                    self.format_region(f, else_region, indent_level + 1)?;
+
+                    write!(f, "{}}}", indent)?;
+                }
+                Instruction::While(while_instr) => {
+                    write!(f, "While(")?;
+                    if !node.predecessors.is_empty() {
+                        // Find the predecessor control value
+                        let pred_idx = region
+                            .nodes
+                            .iter()
+                            .position(|&nid| nid == node.predecessors[0])
+                            .unwrap_or(0);
+                        write!(f, "%c{}; ", pred_idx)?;
+                    }
+                    write!(f, "condition=")?;
+                    self.format_value_id(f, node.args[0])?;
+                    writeln!(f, ") {{")?;
+
+                    let cond_region = self.resolve_region(while_instr.cond);
+                    self.format_region(f, cond_region, indent_level + 1)?;
+
+                    let body_region = self.resolve_region(while_instr.body);
+                    self.format_region(f, body_region, indent_level + 1)?;
+
+                    write!(f, "{}}}", indent)?;
+                }
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+
+    fn format_value_id(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        value_id: ValueId,
+    ) -> std::fmt::Result {
+        match value_id {
+            ValueId::Global(GlobalValueId(idx)) => {
+                if let Some(variable) = self.globals.get(idx) {
+                    if let Some(name) = &variable.name {
+                        write!(f, "%v_{}", name)?;
+                    } else {
+                        write!(f, "%v{}", idx)?;
+                    }
+                } else {
+                    write!(f, "%v{}", idx)?;
+                }
+            }
+            ValueId::Input(_, idx) => write!(f, "%i{}", idx)?,
+            ValueId::Output(_, idx) => write!(f, "%o{}", idx)?,
+        }
+        Ok(())
+    }
 }
 
-impl VM {
-    pub fn new(numba_runtime: Arc<NumbaRuntime>, commands: Vec<CommandWithVariables>) -> Self {
+fn format_tensor_type(tensor_type: &TensorType) -> String {
+    use crate::array::DType;
+
+    let dtype_str = match tensor_type.dtype {
+        DType::F32 => "f32",
+        DType::F64 => "f64",
+        DType::I32 => "i32",
+        DType::I64 => "i64",
+        DType::U32 => "u32",
+        DType::U64 => "u64",
+        DType::I16 => "i16",
+        DType::U16 => "u16",
+        DType::I8 => "i8",
+        DType::U8 => "u8",
+        DType::Bool => "bool",
+    };
+
+    // For now, we'll show the rank with unknown dimensions
+    let shape_str = if tensor_type.rank == 0 {
+        "[]".to_string()
+    } else {
+        let dims = vec!["?"; tensor_type.rank];
+        format!("[{}]", dims.join(", "))
+    };
+
+    format!("{}{}", dtype_str, shape_str)
+}
+
+// Builder pattern implementation
+#[derive(Debug)]
+pub struct ModuleBuilder {
+    regions: Vec<Region>,
+    nodes: Vec<Node>,
+    functions: Vec<Function>,
+    globals: Vec<Variable>,
+    next_region_id: usize,
+    next_node_id: usize,
+    next_function_id: usize,
+    next_global_id: usize,
+}
+
+impl ModuleBuilder {
+    pub fn new() -> Self {
         Self {
-            numba_runtime,
-            commands,
+            regions: Vec::new(),
+            nodes: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+            next_region_id: 0,
+            next_node_id: 0,
+            next_function_id: 0,
+            next_global_id: 0,
         }
     }
 
-    pub fn run(&mut self) -> Result<()> {
-        let mut c_arg_buffer = CArgBuffer::new();
-        let mut command_variables = Vec::new();
-        for CommandWithVariables { command, variables } in &self.commands {
-            command_variables.clear();
-            command_variables.extend(variables.iter().map(|var| var.clone()));
-            command.execute(self, &mut c_arg_buffer, &mut command_variables)?;
+    pub fn build(self) -> Module {
+        Module {
+            regions: self.regions,
+            nodes: self.nodes,
+            functions: self.functions,
+            globals: self.globals,
         }
+    }
+
+    pub fn add_global(&mut self, variable: Variable) -> GlobalValueId {
+        let id = GlobalValueId(self.next_global_id);
+        self.next_global_id += 1;
+        self.globals.push(variable);
+        id
+    }
+
+    pub fn add_global_tensor(&mut self, name: Option<String>, tensor_type: TensorType) -> ValueId {
+        let variable = Variable::new(ValueType::Tensor(tensor_type), name);
+        let global_id = self.add_global(variable);
+        ValueId::Global(global_id)
+    }
+
+    pub fn create_function(
+        &mut self,
+        name: String,
+        inputs: Vec<Variable>,
+        outputs: Vec<Variable>,
+    ) -> FunctionBuilder {
+        let function_id = FunctionId(self.next_function_id);
+        self.next_function_id += 1;
+
+        FunctionBuilder {
+            function_id,
+            name,
+            input_variables: inputs,
+            output_variables: outputs,
+            entry_graph: None,
+        }
+    }
+
+    fn add_region(&mut self, region: Region) -> RegionId {
+        let id = RegionId(self.next_region_id);
+        self.next_region_id += 1;
+        self.regions.push(region);
+        id
+    }
+
+    fn add_node(&mut self, node: Node) -> NodeId {
+        let id = NodeId(self.next_node_id);
+        self.next_node_id += 1;
+        self.nodes.push(node);
+        id
+    }
+
+    fn add_function(&mut self, function: Function) -> FunctionId {
+        let id = function.id;
+        self.functions.push(function);
+        id
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionBuilder {
+    function_id: FunctionId,
+    name: String,
+    input_variables: Vec<Variable>,
+    output_variables: Vec<Variable>,
+    entry_graph: Option<RegionId>,
+}
+
+impl FunctionBuilder {
+    pub fn create_region(&self, module_builder: Arc<Mutex<ModuleBuilder>>) -> RegionBuilder {
+        RegionBuilder::new(module_builder, Some(self.clone()))
+    }
+
+    pub fn finish(
+        mut self,
+        module_builder: Arc<Mutex<ModuleBuilder>>,
+        entry_graph: RegionId,
+    ) -> FunctionId {
+        self.entry_graph = Some(entry_graph);
+
+        let function = Function {
+            entry: entry_graph,
+            name: self.name,
+            id: self.function_id,
+            input_variables: self.input_variables,
+            output_variables: self.output_variables,
+        };
+
+        let mut builder = module_builder.lock().unwrap();
+        builder.add_function(function)
+    }
+
+    pub fn function_id(&self) -> FunctionId {
+        self.function_id
+    }
+
+    pub fn input(&self, idx: usize) -> Option<ValueId> {
+        if idx >= self.input_variables.len() {
+            return None;
+        }
+        Some(ValueId::Input(self.function_id, idx))
+    }
+
+    pub fn output(&self, idx: usize) -> Option<ValueId> {
+        if idx >= self.output_variables.len() {
+            return None;
+        }
+        Some(ValueId::Output(self.function_id, idx))
+    }
+
+    pub fn num_inputs(&self) -> usize {
+        self.input_variables.len()
+    }
+
+    pub fn num_outputs(&self) -> usize {
+        self.output_variables.len()
+    }
+}
+
+#[derive(Debug)]
+pub struct RegionBuilder {
+    module_builder: Arc<Mutex<ModuleBuilder>>,
+    nodes: Vec<NodeId>,
+    function_builder: Option<FunctionBuilder>,
+}
+
+impl RegionBuilder {
+    pub fn new(
+        module_builder: Arc<Mutex<ModuleBuilder>>,
+        function_builder: Option<FunctionBuilder>,
+    ) -> Self {
+        Self {
+            module_builder,
+            nodes: Vec::new(),
+            function_builder,
+        }
+    }
+
+    pub fn add_node(&mut self, instruction: Instruction, args: Vec<ValueId>) -> NodeId {
+        let node = Node {
+            args,
+            successors: Vec::new(),
+            predecessors: Vec::new(),
+            instruction,
+        };
+
+        let mut builder = self.module_builder.lock().unwrap();
+        let node_id = builder.add_node(node);
+        self.nodes.push(node_id);
+        node_id
+    }
+
+    pub fn add_dependency(&mut self, from: NodeId, to: NodeId) {
+        let mut builder = self.module_builder.lock().unwrap();
+        builder.nodes[from.0].successors.push(to);
+        builder.nodes[to.0].predecessors.push(from);
+    }
+
+    pub fn finish(self) -> (Option<FunctionBuilder>, RegionId) {
+        let region = Region { nodes: self.nodes };
+
+        let mut builder = self.module_builder.lock().unwrap();
+        let region_id = builder.add_region(region);
+        (self.function_builder, region_id)
+    }
+
+    pub fn create_subregion(&self) -> RegionBuilder {
+        RegionBuilder::new(self.module_builder.clone(), None)
+    }
+
+    pub fn add_alloc(
+        &mut self,
+        target: ValueId,
+        shape: ValueId,
+        tensor_type: TensorType,
+    ) -> NodeId {
+        let instruction = Instruction::alloc(tensor_type);
+        self.add_node(instruction, vec![target, shape])
+    }
+
+    pub fn add_external_call(
+        &mut self,
+        func: ExternalArrayFunc,
+        keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
+        args: Vec<ValueId>,
+        arg_is_mut: Vec<bool>,
+        name: String,
+    ) -> NodeId {
+        let instruction =
+            Instruction::external_call(func, keep_alive, args.clone(), arg_is_mut, name);
+        self.add_node(instruction, args)
+    }
+
+    pub fn add_if(
+        &mut self,
+        condition: ValueId,
+        then_region: RegionId,
+        else_region: RegionId,
+    ) -> NodeId {
+        let instruction = Instruction::if_(then_region, else_region);
+        self.add_node(instruction, vec![condition])
+    }
+
+    pub fn add_while(
+        &mut self,
+        condition: ValueId,
+        cond_region: RegionId,
+        body_region: RegionId,
+    ) -> NodeId {
+        let instruction = Instruction::while_(cond_region, body_region);
+        self.add_node(instruction, vec![condition])
+    }
+}
+
+impl Default for ModuleBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::{DType, Order};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_builder_pattern() {
+        // Create the module builder inside an Arc<Mutex<_>>
+        let module_builder = Arc::new(Mutex::new(ModuleBuilder::new()));
+
+        // Add some global variables
+        let temp_array_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(
+                Some("temp_array".to_string()),
+                TensorType {
+                    rank: 2,
+                    dtype: DType::F32,
+                    order: Order::RowMajor,
+                },
+            )
+        };
+
+        let condition_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(
+                Some("condition".to_string()),
+                TensorType {
+                    rank: 0,
+                    dtype: DType::Bool,
+                    order: Order::RowMajor,
+                },
+            )
+        };
+
+        // Create a function
+        let function_builder = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.create_function(
+                "main".to_string(),
+                vec![
+                    Variable::new(
+                        ValueType::Tensor(TensorType {
+                            rank: 2,
+                            dtype: DType::F32,
+                            order: Order::RowMajor,
+                        }),
+                        None,
+                    ),
+                    Variable::new(
+                        ValueType::Tensor(TensorType {
+                            rank: 1,
+                            dtype: DType::I64,
+                            order: Order::RowMajor,
+                        }),
+                        None,
+                    ),
+                ],
+                vec![Variable::new(
+                    ValueType::Tensor(TensorType {
+                        rank: 2,
+                        dtype: DType::F32,
+                        order: Order::RowMajor,
+                    }),
+                    None,
+                )],
+            )
+        };
+
+        // Create the main region
+        let mut region_builder = function_builder.create_region(module_builder.clone());
+
+        // Add an allocation instruction
+        let alloc_node = region_builder.add_alloc(
+            temp_array_id,
+            function_builder.input(1).unwrap(), // shape input
+            TensorType {
+                rank: 2,
+                dtype: DType::F32,
+                order: Order::RowMajor,
+            },
+        );
+
+        // Create subregions for if branches
+        let then_region_id = {
+            let then_builder = region_builder.create_subregion();
+            // Add some node to the then branch (placeholder)
+            let (_, region_id) = then_builder.finish();
+            region_id
+        };
+
+        let else_region_id = {
+            let else_builder = region_builder.create_subregion();
+            // Add some node to the else branch (placeholder)
+            let (_, region_id) = else_builder.finish();
+            region_id
+        };
+
+        // Add an if instruction
+        let if_node = region_builder.add_if(condition_id, then_region_id, else_region_id);
+
+        // Add dependency
+        region_builder.add_dependency(alloc_node, if_node);
+
+        // Finish the region
+        let (function_builder, main_region_id) = region_builder.finish();
+        let function_builder = function_builder.unwrap();
+
+        // Finish the function
+        let _function_id = function_builder.finish(module_builder.clone(), main_region_id);
+
+        // Build the final module
+        let module = {
+            let builder =
+                std::mem::replace(&mut *module_builder.lock().unwrap(), ModuleBuilder::new());
+            builder.build()
+        };
+
+        // Test the display output
+        println!("{}", module);
+
+        // Verify structure
+        assert_eq!(module.num_functions(), 1);
+        assert_eq!(module.num_variables(), 2);
+        assert!(module.num_regions() >= 3); // main + then + else
+    }
+
+    #[test]
+    fn test_complex_builder_example() {
+        use crate::ffi::ExternalArrayFunc;
+
+        // Create the module builder inside an Arc<Mutex<_>>
+        let module_builder = Arc::new(Mutex::new(ModuleBuilder::new()));
+
+        // Add global variables
+        let input_array_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(
+                Some("input_data".to_string()),
+                TensorType {
+                    rank: 2,
+                    dtype: DType::F32,
+                    order: Order::RowMajor,
+                },
+            )
+        };
+
+        let output_array_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(
+                Some("output_data".to_string()),
+                TensorType {
+                    rank: 2,
+                    dtype: DType::F32,
+                    order: Order::RowMajor,
+                },
+            )
+        };
+
+        let condition_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(
+                Some("should_transform".to_string()),
+                TensorType {
+                    rank: 0,
+                    dtype: DType::Bool,
+                    order: Order::RowMajor,
+                },
+            )
+        };
+
+        // Create a function with inputs and outputs
+        let function_builder = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.create_function(
+                "process_data".to_string(),
+                vec![
+                    Variable::new(
+                        ValueType::Tensor(TensorType {
+                            rank: 2,
+                            dtype: DType::F32,
+                            order: Order::RowMajor,
+                        }),
+                        Some("input".to_string()),
+                    ),
+                    Variable::new(
+                        ValueType::Tensor(TensorType {
+                            rank: 1,
+                            dtype: DType::I64,
+                            order: Order::RowMajor,
+                        }),
+                        Some("shape".to_string()),
+                    ),
+                ],
+                vec![Variable::new(
+                    ValueType::Tensor(TensorType {
+                        rank: 2,
+                        dtype: DType::F32,
+                        order: Order::RowMajor,
+                    }),
+                    Some("result".to_string()),
+                )],
+            )
+        };
+
+        // Create the main graph
+        let mut main_region = function_builder.create_region(module_builder.clone());
+
+        // Add allocation for output
+        let alloc_node = main_region.add_alloc(
+            output_array_id,
+            function_builder.input(1).unwrap(), // shape input
+            TensorType {
+                rank: 2,
+                dtype: DType::F32,
+                order: Order::RowMajor,
+            },
+        );
+
+        // Create dummy external functions for testing
+        extern "C" fn compute_condition_fn(
+            _size: usize,
+            _buffers: *mut *mut std::ffi::c_void,
+            _meminfos: *mut *mut crate::ffi::NRT_MemInfo,
+            _nbytes: *mut usize,
+            _ranks: *const usize,
+            _shapes: *mut usize,
+            _strides: *mut usize,
+            _dtypes: *mut u8,
+            _modified: *mut u8,
+        ) -> i64 {
+            0 // Success
+        }
+
+        extern "C" fn operation_a_fn(
+            _size: usize,
+            _buffers: *mut *mut std::ffi::c_void,
+            _meminfos: *mut *mut crate::ffi::NRT_MemInfo,
+            _nbytes: *mut usize,
+            _ranks: *const usize,
+            _shapes: *mut usize,
+            _strides: *mut usize,
+            _dtypes: *mut u8,
+            _modified: *mut u8,
+        ) -> i64 {
+            0 // Success
+        }
+
+        extern "C" fn operation_b_fn(
+            _size: usize,
+            _buffers: *mut *mut std::ffi::c_void,
+            _meminfos: *mut *mut crate::ffi::NRT_MemInfo,
+            _nbytes: *mut usize,
+            _ranks: *const usize,
+            _shapes: *mut usize,
+            _strides: *mut usize,
+            _dtypes: *mut u8,
+            _modified: *mut u8,
+        ) -> i64 {
+            0 // Success
+        }
+
+        extern "C" fn copy_result_fn(
+            _size: usize,
+            _buffers: *mut *mut std::ffi::c_void,
+            _meminfos: *mut *mut crate::ffi::NRT_MemInfo,
+            _nbytes: *mut usize,
+            _ranks: *const usize,
+            _shapes: *mut usize,
+            _strides: *mut usize,
+            _dtypes: *mut u8,
+            _modified: *mut u8,
+        ) -> i64 {
+            0 // Success
+        }
+
+        // Add external call to compute condition
+        let condition_node = main_region.add_external_call(
+            ExternalArrayFunc::new(compute_condition_fn),
+            None,
+            vec![function_builder.input(0).unwrap(), condition_id],
+            vec![false, true], // input is immutable, condition is mutable
+            "compute_condition".to_string(),
+        );
+
+        let tensor_type = TensorType {
+            rank: 2,
+            dtype: DType::F32,
+            order: Order::RowMajor,
+        };
+
+        let temp_array_id = {
+            let mut builder = module_builder.lock().unwrap();
+            builder.add_global_tensor(Some("temp_array".to_string()), tensor_type)
+        };
+
+        // Add an allocation instruction
+        let alloc_node = main_region.add_alloc(
+            temp_array_id,
+            function_builder.input(1).unwrap(),
+            tensor_type,
+        );
+
+        // Create subregions for if branches
+        let then_region_id = {
+            let mut then_builder = main_region.create_subregion();
+            then_builder.add_external_call(
+                ExternalArrayFunc::new(operation_a_fn),
+                None,
+                vec![function_builder.input(0).unwrap(), input_array_id],
+                vec![false, true], // input immutable, temp mutable
+                "operation_a".to_string(),
+            );
+            let (_, region_id) = then_builder.finish();
+            region_id
+        };
+
+        let else_region_id = {
+            let mut else_builder = main_region.create_subregion();
+            else_builder.add_external_call(
+                ExternalArrayFunc::new(operation_b_fn),
+                None,
+                vec![function_builder.input(0).unwrap(), input_array_id],
+                vec![false, true], // input immutable, temp mutable
+                "operation_b".to_string(),
+            );
+            let (_, region_id) = else_builder.finish();
+            region_id
+        };
+
+        // Add conditional execution
+        let if_node = main_region.add_if(condition_id, then_region_id, else_region_id);
+
+        // Add final copy operation
+        let copy_node = main_region.add_external_call(
+            ExternalArrayFunc::new(copy_result_fn),
+            None,
+            vec![input_array_id, function_builder.output(0).unwrap()],
+            vec![false, true], // src immutable, dst mutable
+            "copy_result".to_string(),
+        );
+
+        // Set up dependencies
+        main_region.add_dependency(alloc_node, condition_node);
+        main_region.add_dependency(condition_node, if_node);
+        main_region.add_dependency(if_node, copy_node);
+
+        // Finish the region and function
+        let (function_builder, main_region_id) = main_region.finish();
+        let function_builder = function_builder.unwrap();
+        let _function_id = function_builder.finish(module_builder.clone(), main_region_id);
+
+        // Build the final module
+        let module = {
+            let builder =
+                std::mem::replace(&mut *module_builder.lock().unwrap(), ModuleBuilder::new());
+            builder.build()
+        };
+
+        // Print the generated code
+        println!("Generated Module:");
+        println!("{}", module);
+
+        // Verify structure
+        assert_eq!(module.num_functions(), 1);
+        assert_eq!(module.num_variables(), 3); // input_data, output_data, should_transform
+        assert!(module.num_regions() >= 3); // main + then + else branches
+    }
+}
+
+pub trait ValueStore {
+    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value>;
+    // Might be a MutexGuard!
+    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value>;
+}
+
+#[derive(Debug)]
+struct RayonValue(Arc<Mutex<Value>>);
+
+pub struct RayonValueStore {
+    globals: Vec<RayonValue>,
+    inputs: Vec<Vec<RayonValue>>,
+    outputs: Vec<Vec<RayonValue>>,
+}
+
+impl ValueStore for RayonValueStore {
+    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value> {
+        match value_id {
+            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.lock().unwrap(),
+            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.lock().unwrap(),
+            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.lock().unwrap(),
+        }
+    }
+
+    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value> {
+        match value_id {
+            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.lock().unwrap(),
+            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.lock().unwrap(),
+            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.lock().unwrap(),
+        }
+    }
+}
+
+pub trait ExecutionContext {
+    type ValueStore: ValueStore;
+
+    fn run_region(&self, region_id: RegionId, values: &Self::ValueStore) -> Result<()>;
+    fn numba_runtime(&self) -> &Arc<NumbaRuntime>;
+
+    fn create_values(&self) -> Self::ValueStore;
+    fn run(&self, func: FunctionId, values: &Self::ValueStore) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub struct RayonExecutionContext<'a> {
+    module: &'a Module,
+    // One per NodeId
+    missing_counts: Vec<CachePadded<AtomicUsize>>,
+    numba_runtime: Arc<NumbaRuntime>,
+}
+
+impl<'a> RayonExecutionContext<'a> {
+    pub fn new(module: &'a Module, numba_runtime: Arc<NumbaRuntime>) -> Self {
+        let missing_counts = (0..module.nodes.len())
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
+        Self {
+            module,
+            missing_counts,
+            numba_runtime,
+        }
+    }
+
+    fn resolve_missing_count(&self, node_id: NodeId) -> &AtomicUsize {
+        &self.missing_counts[node_id.0]
+    }
+}
+
+impl<'a> ExecutionContext for RayonExecutionContext<'a> {
+    type ValueStore = RayonValueStore;
+
+    fn run_region(&self, region_id: RegionId, values: &RayonValueStore) -> Result<()> {
+        let module = self.module;
+        let region = module.resolve_region(region_id);
+
+        let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
+        region.nodes.iter().for_each(|&node_id| {
+            let node = module.resolve_node(node_id);
+            let missing_count = node.predecessors.len();
+            let missing_count_loc = self.resolve_missing_count(node_id);
+            // TODO check ordering
+            missing_count_loc.store(missing_count, std::sync::atomic::Ordering::Relaxed);
+            if missing_count == 0 {
+                ready_nodes.push(node_id);
+            }
+        });
+
+        fn run_node(
+            ctx: &RayonExecutionContext,
+            module: &Module,
+            values: &RayonValueStore,
+            node_id: NodeId,
+        ) -> Result<()> {
+            let node = module.resolve_node(node_id);
+            node.run(ctx, values)?;
+
+            // Notify successors
+            let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
+            for &succ_id in node.successors.iter() {
+                let succ_missing_count = ctx.resolve_missing_count(succ_id);
+                let prev_count =
+                    succ_missing_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                assert!(prev_count > 0);
+                if prev_count == 1 {
+                    // Now ready
+                    let node_id = succ_id;
+                    ready_nodes.push(node_id);
+                }
+            }
+
+            // Run ready nodes
+            ready_nodes
+                .into_par_iter()
+                .try_for_each(|&node_id| run_node(ctx, module, values, node_id))?;
+            Ok(())
+        }
+
+        ready_nodes
+            .into_par_iter()
+            .try_for_each(|&node_id| run_node(self, module, values, node_id))?;
         Ok(())
+    }
+
+    fn numba_runtime(&self) -> &Arc<NumbaRuntime> {
+        &self.numba_runtime
+    }
+
+    fn create_values(&self) -> Self::ValueStore {
+        let module = self.module;
+        // Count the maximum global value ID used across all nodes
+        let mut max_global_id = 0;
+        for node in &module.nodes {
+            for &arg in &node.args {
+                if let ValueId::Global(GlobalValueId(id)) = arg {
+                    max_global_id = max_global_id.max(id + 1);
+                }
+            }
+        }
+
+        let mut globals = Vec::with_capacity(max_global_id);
+        for _ in 0..max_global_id {
+            globals.push(RayonValue(Arc::new(Mutex::new(Value::Empty))));
+        }
+
+        RayonValueStore {
+            globals,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    fn run(&self, function_id: FunctionId, values: &Self::ValueStore) -> Result<()> {
+        let entry = self.module.resolve_function(function_id).entry;
+        self.run_region(entry, values)
     }
 }
