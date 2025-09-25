@@ -32,6 +32,45 @@ pub struct NumbaRuntime {
     pub(crate) get_data: NRT_get_data,
 }
 
+impl NumbaRuntime {
+    /// Creates a NumbaRuntime that panics when any function is called.
+    /// This is useful for testing and examples where you want to demonstrate
+    /// the VM structure without actually executing Numba-dependent code.
+    pub fn make_panic_runtime() -> Self {
+        unsafe extern "C" fn panic_allocate(_nbytes: usize) -> *mut NRT_MemInfo {
+            panic!("NumbaRuntime::allocate called on panic runtime - this should only be used for demonstration");
+        }
+
+        unsafe extern "C" fn panic_manage_memory(
+            _data: *mut c_void,
+            _dtor: NRT_managed_dtor,
+        ) -> *mut NRT_MemInfo {
+            panic!("NumbaRuntime::manage_memory called on panic runtime - this should only be used for demonstration");
+        }
+
+        unsafe extern "C" fn panic_acquire(_mi: *mut NRT_MemInfo) {
+            panic!("NumbaRuntime::acquire called on panic runtime - this should only be used for demonstration");
+        }
+
+        unsafe extern "C" fn panic_release(_mi: *mut NRT_MemInfo) {
+            panic!("NumbaRuntime::release called on panic runtime - this should only be used for demonstration");
+        }
+
+        unsafe extern "C" fn panic_get_data(_mi: *mut NRT_MemInfo) -> *mut c_void {
+            panic!("NumbaRuntime::get_data called on panic runtime - this should only be used for demonstration");
+        }
+
+        NumbaRuntime {
+            allocate: panic_allocate,
+            manage_memory: panic_manage_memory,
+            acquire: panic_acquire,
+            release: panic_release,
+            get_data: panic_get_data,
+        }
+    }
+}
+
+#[derive(Debug)]
 #[repr(C)]
 pub struct CallCommandArg<'buffer> {
     // The total number of buffers
@@ -58,6 +97,7 @@ pub struct CallCommandArg<'buffer> {
     _phantom: std::marker::PhantomData<&'buffer ()>,
 }
 
+#[derive(Debug)]
 pub struct ExternalCallBuffer {
     buffers: Vec<*mut c_void>,
     meminfo: Vec<*mut NRT_MemInfo>,

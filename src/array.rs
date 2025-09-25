@@ -22,16 +22,13 @@ pub enum Order {
     Arbitrary,
 }
 
-impl Order {
-    pub fn from_string(s: &str) -> Result<Self> {
-        match s {
-            "C" | "c" => Ok(Self::RowMajor),
-            "F" | "f" => Ok(Self::ColumnMajor),
-            "A" | "a" => Ok(Self::Arbitrary),
-            _ => anyhow::bail!("Unknown order string: {}", s),
-        }
+impl Default for Order {
+    fn default() -> Self {
+        Self::RowMajor
     }
+}
 
+impl Order {
     pub fn c() -> Self {
         Self::RowMajor
     }
@@ -39,14 +36,29 @@ impl Order {
     pub fn f() -> Self {
         Self::ColumnMajor
     }
+}
 
-    pub fn to_string(&self) -> String {
-        match self {
+impl TryFrom<&str> for Order {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value {
+            "C" | "c" => Ok(Self::RowMajor),
+            "F" | "f" => Ok(Self::ColumnMajor),
+            "A" | "a" => Ok(Self::Arbitrary),
+            _ => anyhow::bail!("Unknown order string: {}", value),
+        }
+    }
+}
+
+impl Display for Order {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
             Order::RowMajor => "C",
             Order::ColumnMajor => "F",
             Order::Arbitrary => "A",
-        }
-        .to_owned()
+        };
+        write!(f, "{}", s)
     }
 }
 
@@ -72,11 +84,43 @@ impl TryInto<ndarray::Order> for Order {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TensorType {
-    pub rank: usize,
     pub dtype: DType,
     pub order: Order,
+    pub shape: Option<SmallVec<[Option<usize>; INLINE_SIZE]>>,
+}
+
+impl TensorType {
+    pub fn rank(&self) -> Option<usize> {
+        match &self.shape {
+            Some(shape) => Some(shape.len()),
+            None => None,
+        }
+    }
+}
+
+impl Display for TensorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shape_str = match &self.shape {
+            None => "[...]".to_string(),
+            Some(shape) => {
+                let shape: Vec<String> = shape
+                    .iter()
+                    .map(|len| match len {
+                        Some(d) => d.to_string(),
+                        None => "?".to_string(),
+                    })
+                    .collect();
+                format!("[{}]", shape.join(", "))
+            }
+        };
+        write!(
+            f,
+            "TensorType(dtype={}, shape={}, order={})",
+            self.dtype, shape_str, self.order
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +138,7 @@ pub struct NumbaBuffer {
 // SAFETY: NumbaBuffer can be sent between threads
 // because NRT_MemInfo is thread-safe.
 unsafe impl Send for NumbaBuffer {}
+unsafe impl Sync for NumbaBuffer {}
 
 impl NumbaBuffer {
     pub(crate) fn from_buffer_info(
@@ -532,12 +577,186 @@ impl Tensor {
         }
     }
 
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn order(&self) -> Option<Order> {
+        // TODO clean this up and make sure there are no overflows
+        match &self.buffer {
+            Buffer::Numba(buf) => {
+                if buf.byte_strides.is_empty() || self.shape.is_empty() {
+                    return Some(Order::Arbitrary);
+                }
+                let ndim = self.shape.len();
+                if buf.byte_strides[ndim - 1] == buf.nbytes / self.shape[ndim - 1] {
+                    Some(Order::RowMajor)
+                } else if buf.byte_strides[0] == buf.nbytes / self.shape[0] {
+                    Some(Order::ColumnMajor)
+                } else {
+                    Some(Order::Arbitrary)
+                }
+            }
+            Buffer::Native(buf) => {
+                if buf.byte_strides.is_empty() || self.shape.is_empty() {
+                    return Some(Order::Arbitrary);
+                }
+                let ndim = self.shape.len();
+                if buf.byte_strides[ndim - 1] == self.dtype.size_bytes() {
+                    Some(Order::RowMajor)
+                } else if buf.byte_strides[0] == self.dtype.size_bytes() {
+                    Some(Order::ColumnMajor)
+                } else {
+                    Some(Order::Arbitrary)
+                }
+            }
+            Buffer::Empty => Some(Order::Arbitrary),
+        }
+    }
+
     pub(crate) fn as_scalar_bool(&self) -> Result<bool> {
-        todo!()
+        // Check if this is a scalar (0-dimensional tensor)
+        if !self.shape.is_empty() {
+            anyhow::bail!("Tensor is not a scalar, shape: {:?}", self.shape);
+        }
+
+        // Handle different dtypes that can be interpreted as boolean
+        match self.dtype {
+            DType::Bool => {
+                todo!("bool arrays are not implemented fully");
+            }
+            DType::I32 => {
+                let array_view = self.as_array_view::<i32>()?;
+                match array_view {
+                    Some(view) => {
+                        if view.is_empty() {
+                            anyhow::bail!("Scalar tensor has no data");
+                        }
+                        Ok(view[ndarray::IxDyn(&[])] != 0)
+                    }
+                    None => anyhow::bail!("Tensor buffer is empty"),
+                }
+            }
+            DType::I64 => {
+                let array_view = self.as_array_view::<i64>()?;
+                match array_view {
+                    Some(view) => {
+                        if view.is_empty() {
+                            anyhow::bail!("Scalar tensor has no data");
+                        }
+                        Ok(view[ndarray::IxDyn(&[])] != 0)
+                    }
+                    None => anyhow::bail!("Tensor buffer is empty"),
+                }
+            }
+            DType::U32 => {
+                let array_view = self.as_array_view::<u32>()?;
+                match array_view {
+                    Some(view) => {
+                        if view.is_empty() {
+                            anyhow::bail!("Scalar tensor has no data");
+                        }
+                        Ok(view[ndarray::IxDyn(&[])] != 0)
+                    }
+                    None => anyhow::bail!("Tensor buffer is empty"),
+                }
+            }
+            DType::U64 => {
+                let array_view = self.as_array_view::<u64>()?;
+                match array_view {
+                    Some(view) => {
+                        if view.is_empty() {
+                            anyhow::bail!("Scalar tensor has no data");
+                        }
+                        Ok(view[ndarray::IxDyn(&[])] != 0)
+                    }
+                    None => anyhow::bail!("Tensor buffer is empty"),
+                }
+            }
+            _ => anyhow::bail!(
+                "Tensor dtype cannot be interpreted as boolean, got: {:?}",
+                self.dtype
+            ),
+        }
     }
 
     pub(crate) fn as_shape(&self) -> Result<Shape> {
-        todo!()
+        // Check if dtype is appropriate for shape (should be integer)
+        match self.dtype {
+            DType::I64 | DType::I32 | DType::U64 | DType::U32 => {}
+            _ => anyhow::bail!(
+                "Tensor dtype is not suitable for shape, got: {:?}",
+                self.dtype
+            ),
+        }
+
+        // Shape tensor should be 1-dimensional
+        if self.shape.len() != 1 {
+            anyhow::bail!(
+                "Shape tensor must be 1-dimensional, got shape: {:?}",
+                self.shape
+            );
+        }
+
+        let shape_len = self.shape[0];
+        let mut result_shape = Shape::with_capacity(shape_len);
+
+        // Extract shape values based on dtype
+        match self.dtype {
+            DType::I64 => {
+                let array_view = self.as_array_view::<i64>()?;
+                if let Some(view) = array_view {
+                    for &dim in view.iter() {
+                        if dim < 0 {
+                            anyhow::bail!("Negative dimension in shape: {}", dim);
+                        }
+                        result_shape.push(dim as usize);
+                    }
+                } else {
+                    anyhow::bail!("Tensor buffer is empty");
+                }
+            }
+            DType::I32 => {
+                let array_view = self.as_array_view::<i32>()?;
+                if let Some(view) = array_view {
+                    for &dim in view.iter() {
+                        if dim < 0 {
+                            anyhow::bail!("Negative dimension in shape: {}", dim);
+                        }
+                        result_shape.push(dim as usize);
+                    }
+                } else {
+                    anyhow::bail!("Tensor buffer is empty");
+                }
+            }
+            DType::U64 => {
+                let array_view = self.as_array_view::<u64>()?;
+                if let Some(view) = array_view {
+                    for &dim in view.iter() {
+                        result_shape.push(dim as usize);
+                    }
+                } else {
+                    anyhow::bail!("Tensor buffer is empty");
+                }
+            }
+            DType::U32 => {
+                let array_view = self.as_array_view::<u32>()?;
+                if let Some(view) = array_view {
+                    for &dim in view.iter() {
+                        result_shape.push(dim as usize);
+                    }
+                } else {
+                    anyhow::bail!("Tensor buffer is empty");
+                }
+            }
+            _ => unreachable!("Already checked dtype above"),
+        }
+
+        Ok(result_shape)
     }
 }
 

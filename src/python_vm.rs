@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use pyo3::prelude::*;
+use pyo3::{prelude::*, types::PyTuple, IntoPyObjectExt};
+use smallvec::SmallVec;
 
 use crate::{
     array::{DType, Order, TensorType},
@@ -21,14 +22,22 @@ pub struct PyTensorType {
 #[pymethods]
 impl PyTensorType {
     #[new]
-    pub fn new(dtype: DType, rank: usize, order: Order) -> PyResult<Self> {
-        let tensor_type = TensorType { dtype, rank, order };
+    pub fn new(dtype: DType, shape: Option<Vec<Option<usize>>>, order: Order) -> PyResult<Self> {
+        let shape = match shape {
+            Some(s) => Some(SmallVec::from_vec(s)),
+            None => None,
+        };
+        let tensor_type = TensorType {
+            dtype,
+            shape,
+            order,
+        };
         Ok(Self { inner: tensor_type })
     }
 
     #[getter]
-    pub fn rank(&self) -> usize {
-        self.inner.rank
+    pub fn rank(&self) -> Option<usize> {
+        self.inner.rank()
     }
 
     #[getter]
@@ -40,6 +49,21 @@ impl PyTensorType {
     pub fn order(&self) -> String {
         self.inner.order.to_string()
     }
+
+    #[getter]
+    pub fn shape(&self, py: Python<'_>) -> PyResult<Option<Py<PyTuple>>> {
+        let Some(shape) = &self.inner.shape else {
+            return Ok(None);
+        };
+        let values: PyResult<Vec<_>> = shape
+            .iter()
+            .map(|maybe_len| match maybe_len {
+                Some(len) => Ok(len.into_py_any(py)?),
+                None => Ok(py.None()),
+            })
+            .collect();
+        Ok(Some(PyTuple::new(py, values?.into_iter())?.unbind()))
+    }
 }
 
 impl<'py> FromPyObject<'py> for DType {
@@ -47,7 +71,7 @@ impl<'py> FromPyObject<'py> for DType {
         let ob_str = ob.str()?;
         let dtype_str: &str = ob_str.to_str()?;
         Ok(DType::from_string(dtype_str).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid DType string: {}", dtype_str))
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid dtype string: {}", dtype_str))
         })?)
     }
 }
@@ -56,8 +80,8 @@ impl<'py> FromPyObject<'py> for Order {
     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
         let ob_str = ob.str()?;
         let order_str: &str = ob_str.to_str()?;
-        Ok(Order::from_string(order_str).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid Order string: {}", e))
+        Ok(order_str.try_into().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid order string: {}", e))
         })?)
     }
 }

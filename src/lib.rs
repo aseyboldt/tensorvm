@@ -9,9 +9,9 @@ pub use crate::{
     array::{Buffer, DType, Order, Shape, Tensor, TensorType},
     ffi::{CallCommandArg, ExternalArrayFunc, NumbaRuntime},
     vm::{
-        ExecutionContext, FunctionBuilder, GlobalValueId, Instruction, Module, ModuleBuilder,
-        NodeId, RayonExecutionContext, RayonValueStore, Region, RegionBuilder, RegionId, ValueId,
-        ValueStore, ValueType, Variable,
+        DynInstruction, Error, ExecutionContext, FunctionBuilder, GlobalValueId, Instruction,
+        Module, ModuleBuilder, NodeId, RayonExecutionContext, RayonValueStore, Region,
+        RegionBuilder, RegionId, Value, ValueId, ValueStore, ValueType, Variable,
     },
 };
 

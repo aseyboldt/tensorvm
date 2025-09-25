@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     fmt::{Debug, Display},
     ops::{Deref, DerefMut},
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc, Mutex, RwLock},
 };
 
 use crossbeam_utils::CachePadded;
@@ -119,6 +119,7 @@ impl Node {
 #[derive(Debug)]
 pub struct Region {
     nodes: Vec<NodeId>,
+    sequential: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -243,6 +244,10 @@ impl RunInstruction for ExternalCall {
             Ok(())
         })
     }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 // Takes two arguments: target and shape
@@ -287,6 +292,10 @@ impl RunInstruction for Alloc {
         *target_value = Value::Tensor(tensor);
         Ok(())
     }
+
+    fn name(&self) -> &str {
+        "Alloc"
+    }
 }
 
 #[derive(Debug)]
@@ -319,12 +328,21 @@ impl RunInstruction for If {
             ctx.run_region(self.else_branch, store)
         }
     }
+
+    fn name(&self) -> &str {
+        "If"
+    }
 }
 
 #[derive(Debug)]
 pub struct While {
     cond: RegionId,
     body: RegionId,
+}
+
+#[derive(Debug)]
+pub struct Block {
+    region: RegionId,
 }
 
 impl RunInstruction for While {
@@ -354,6 +372,41 @@ impl RunInstruction for While {
         }
         Ok(())
     }
+
+    fn name(&self) -> &str {
+        "While"
+    }
+}
+
+impl RunInstruction for Block {
+    fn run<C: ExecutionContext>(
+        &self,
+        ctx: &C,
+        store: &C::ValueStore,
+        args: &[ValueId],
+    ) -> Result<()> {
+        if !args.is_empty() {
+            return Err(Error::InvalidGraphError {
+                kind: InvalidGraphKind::WrongArgumentCount {
+                    instruction: "Block".to_string(),
+                    expected: 0,
+                    actual: args.len(),
+                },
+            });
+        }
+        ctx.run_region(self.region, store)
+    }
+
+    fn name(&self) -> &str {
+        "Block"
+    }
+}
+
+pub trait DynInstruction: Send + Sync + Display + Debug {
+    fn run_dyn(&self, inputs: &[&Value], outputs: &mut [&mut Value]) -> Result<()>;
+    fn num_inputs(&self) -> usize;
+    fn num_outputs(&self) -> usize;
+    fn name(&self) -> &str;
 }
 
 #[non_exhaustive]
@@ -361,8 +414,10 @@ impl RunInstruction for While {
 pub enum Instruction {
     If(If),
     While(While),
+    Block(Block),
     ExternalCall(ExternalCall),
     Alloc(Alloc),
+    Dyn(Box<dyn DynInstruction>),
 }
 
 impl Instruction {
@@ -373,10 +428,41 @@ impl Instruction {
         args: &[ValueId],
     ) -> Result<()> {
         match self {
-            Instruction::If(i) => i.run(ctx, store, args),
-            Instruction::While(i) => i.run(ctx, store, args),
-            Instruction::ExternalCall(i) => i.run(ctx, store, args),
-            Instruction::Alloc(i) => i.run(ctx, store, args),
+            Instruction::If(inst) => inst.run(ctx, store, args),
+            Instruction::While(inst) => inst.run(ctx, store, args),
+            Instruction::Block(inst) => inst.run(ctx, store, args),
+            Instruction::ExternalCall(inst) => inst.run(ctx, store, args),
+            Instruction::Alloc(inst) => inst.run(ctx, store, args),
+            Instruction::Dyn(inst) => {
+                let num_inputs = inst.num_inputs();
+                let num_outputs = inst.num_outputs();
+                if args.len() != num_inputs + num_outputs {
+                    return Err(Error::InvalidGraphError {
+                        kind: InvalidGraphKind::WrongArgumentCount {
+                            instruction: inst.name().to_string(),
+                            expected: num_inputs + num_outputs,
+                            actual: args.len(),
+                        },
+                    });
+                }
+
+                let input_values: SmallVec<[_; 8]> = args[..num_inputs]
+                    .iter()
+                    .map(|&arg_id| store.resolve_value(arg_id))
+                    .collect();
+
+                let mut output_values: SmallVec<[_; 8]> = args[num_inputs..]
+                    .iter()
+                    .map(|&arg_id| store.resolve_value_mut(arg_id))
+                    .collect();
+
+                let input_refs: SmallVec<[_; 8]> = input_values.iter().map(|v| v.deref()).collect();
+                let mut output_refs: SmallVec<[_; 8]> =
+                    output_values.iter_mut().map(|v| v.deref_mut()).collect();
+                inst.run_dyn(&input_refs, &mut output_refs)?;
+
+                Ok(())
+            }
         }
     }
 
@@ -391,6 +477,10 @@ impl Instruction {
         Instruction::While(While { cond, body })
     }
 
+    pub fn block(region: RegionId) -> Self {
+        Instruction::Block(Block { region })
+    }
+
     pub fn external_call(
         func: ExternalArrayFunc,
         keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
@@ -400,7 +490,7 @@ impl Instruction {
     ) -> Self {
         Instruction::ExternalCall(ExternalCall {
             func,
-            keep_alive,
+            _keep_alive: keep_alive,
             args,
             arg_is_mut,
             name,
@@ -410,15 +500,21 @@ impl Instruction {
     pub fn alloc(tensor_type: TensorType) -> Self {
         Instruction::Alloc(Alloc { tensor_type })
     }
+
+    pub fn dyn_instruction(inst: Box<dyn DynInstruction>) -> Self {
+        Instruction::Dyn(inst)
+    }
 }
 
-trait RunInstruction {
+trait RunInstruction: Debug {
     fn run<C: ExecutionContext>(
         &self,
         ctx: &C,
         store: &C::ValueStore,
         args: &[ValueId],
     ) -> Result<()>;
+
+    fn name(&self) -> &str;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -538,7 +634,7 @@ impl Display for Module {
 
             match &variable.value_type {
                 ValueType::Tensor(tensor_type) => {
-                    write!(f, "{}", format_tensor_type(tensor_type))?;
+                    write!(f, "{}", tensor_type)?;
                 }
             }
             writeln!(f)?;
@@ -558,41 +654,52 @@ impl Display for Module {
         for function in &self.functions {
             write!(f, "fn {}(", function.name)?;
 
-            // Write inputs
-            let mut first = true;
-            for (idx, input_var) in function.input_variables.iter().enumerate() {
-                if !first {
-                    write!(f, ", ")?;
-                }
-                first = false;
-                write!(f, "%i{}: ", idx)?;
-                match &input_var.value_type {
-                    ValueType::Tensor(tensor_type) => {
-                        write!(f, "{}", format_tensor_type(tensor_type))?;
+            // Write inputs on separate lines if there are any
+            if !function.input_variables.is_empty() {
+                writeln!(f)?;
+                for (idx, input_var) in function.input_variables.iter().enumerate() {
+                    write!(f, "    %i{}: ", idx)?;
+                    match &input_var.value_type {
+                        ValueType::Tensor(tensor_type) => {
+                            write!(f, "{}", format_tensor_type(tensor_type))?;
+                        }
+                    }
+                    if idx < function.input_variables.len() - 1 {
+                        writeln!(f, ",")?;
+                    } else {
+                        writeln!(f)?;
                     }
                 }
             }
 
             write!(f, ") -> (")?;
 
-            // Write outputs
-            let mut first = true;
-            for (idx, output_var) in function.output_variables.iter().enumerate() {
-                if !first {
-                    write!(f, ", ")?;
-                }
-                first = false;
-                write!(f, "%o{}: ", idx)?;
-                match &output_var.value_type {
-                    ValueType::Tensor(tensor_type) => {
-                        write!(f, "{}", format_tensor_type(tensor_type))?;
+            // Write outputs on separate lines if there are any
+            if !function.output_variables.is_empty() {
+                writeln!(f)?;
+                for (idx, output_var) in function.output_variables.iter().enumerate() {
+                    write!(f, "    %o{}: ", idx)?;
+                    match &output_var.value_type {
+                        ValueType::Tensor(tensor_type) => {
+                            write!(f, "{}", format_tensor_type(tensor_type))?;
+                        }
+                    }
+                    if idx < function.output_variables.len() - 1 {
+                        writeln!(f, ",")?;
+                    } else {
+                        writeln!(f)?;
                     }
                 }
             }
 
-            writeln!(f, ") {{")?;
+            write!(f, ")")?;
 
             let region = self.resolve_region(function.entry);
+            if region.sequential {
+                write!(f, " [seq]")?;
+            }
+            writeln!(f, " {{")?;
+
             self.format_region(f, region, 1)?;
 
             writeln!(f, "}}")?;
@@ -619,15 +726,7 @@ impl Module {
             match &node.instruction {
                 Instruction::Alloc(_) => {
                     write!(f, "Alloc(")?;
-                    if !node.predecessors.is_empty() {
-                        // Find the predecessor control value
-                        let pred_idx = region
-                            .nodes
-                            .iter()
-                            .position(|&nid| nid == node.predecessors[0])
-                            .unwrap_or(0);
-                        write!(f, "%c{}; ", pred_idx)?;
-                    }
+                    self.format_predecessors(f, &node.predecessors, region)?;
                     write!(f, "target=")?;
                     self.format_value_id(f, node.args[0])?;
                     write!(f, ", shape=")?;
@@ -636,15 +735,7 @@ impl Module {
                 }
                 Instruction::ExternalCall(call) => {
                     write!(f, "ExternalCall(")?;
-                    if !node.predecessors.is_empty() {
-                        // Find the predecessor control value
-                        let pred_idx = region
-                            .nodes
-                            .iter()
-                            .position(|&nid| nid == node.predecessors[0])
-                            .unwrap_or(0);
-                        write!(f, "%c{}; ", pred_idx)?;
-                    }
+                    self.format_predecessors(f, &node.predecessors, region)?;
                     write!(f, "\"{}\"", call.name)?;
                     for (j, &arg) in node.args.iter().enumerate() {
                         write!(f, ", ")?;
@@ -657,40 +748,31 @@ impl Module {
                 }
                 Instruction::If(if_instr) => {
                     write!(f, "If(")?;
-                    if !node.predecessors.is_empty() {
-                        // Find the predecessor control value
-                        let pred_idx = region
-                            .nodes
-                            .iter()
-                            .position(|&nid| nid == node.predecessors[0])
-                            .unwrap_or(0);
-                        write!(f, "%c{}; ", pred_idx)?;
-                    }
+                    self.format_predecessors(f, &node.predecessors, region)?;
                     write!(f, "condition=")?;
                     self.format_value_id(f, node.args[0])?;
-                    writeln!(f, ") then {{")?;
+                    write!(f, ") then")?;
 
                     let then_region = self.resolve_region(if_instr.then_branch);
+                    if then_region.sequential {
+                        write!(f, " [seq]")?;
+                    }
+                    writeln!(f, " {{")?;
                     self.format_region(f, then_region, indent_level + 1)?;
 
-                    writeln!(f, "{}}} else {{", indent)?;
-
+                    write!(f, "{}}} else", indent)?;
                     let else_region = self.resolve_region(if_instr.else_branch);
+                    if else_region.sequential {
+                        write!(f, " [seq]")?;
+                    }
+                    writeln!(f, " {{")?;
                     self.format_region(f, else_region, indent_level + 1)?;
 
                     write!(f, "{}}}", indent)?;
                 }
                 Instruction::While(while_instr) => {
-                    write!(f, "While(")?;
-                    if !node.predecessors.is_empty() {
-                        // Find the predecessor control value
-                        let pred_idx = region
-                            .nodes
-                            .iter()
-                            .position(|&nid| nid == node.predecessors[0])
-                            .unwrap_or(0);
-                        write!(f, "%c{}; ", pred_idx)?;
-                    }
+                    write!(f, "{}(", while_instr.name())?;
+                    self.format_predecessors(f, &node.predecessors, region)?;
                     write!(f, "condition=")?;
                     self.format_value_id(f, node.args[0])?;
                     writeln!(f, ") {{")?;
@@ -703,8 +785,62 @@ impl Module {
 
                     write!(f, "{}}}", indent)?;
                 }
+                Instruction::Block(block_instr) => {
+                    write!(f, "Block(")?;
+                    self.format_predecessors(f, &node.predecessors, region)?;
+                    write!(f, ")")?;
+
+                    let block_region = self.resolve_region(block_instr.region);
+                    if block_region.sequential {
+                        write!(f, " [seq]")?;
+                    }
+                    writeln!(f, " {{")?;
+                    self.format_region(f, block_region, indent_level + 1)?;
+
+                    write!(f, "{}}}", indent)?;
+                }
+                Instruction::Dyn(dyn_instruction) => {
+                    write!(f, "{}(", dyn_instruction.name())?;
+                    self.format_predecessors(f, &node.predecessors, region)?;
+                    for (j, &arg) in node.args.iter().enumerate() {
+                        if j > 0 {
+                            write!(f, ", ")?;
+                        }
+                        self.format_value_id(f, arg)?;
+                    }
+                    write!(f, ")")?;
+                }
             }
             writeln!(f)?;
+        }
+        Ok(())
+    }
+
+    fn format_predecessors(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        predecessors: &[NodeId],
+        region: &Region,
+    ) -> std::fmt::Result {
+        if !predecessors.is_empty() {
+            let pred_indices: Vec<usize> = predecessors
+                .iter()
+                .map(|&pred_id| {
+                    region
+                        .nodes
+                        .iter()
+                        .position(|&nid| nid == pred_id)
+                        .unwrap_or(0)
+                })
+                .collect();
+
+            for (i, idx) in pred_indices.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "%c{}", idx)?;
+            }
+            write!(f, "; ")?;
         }
         Ok(())
     }
@@ -718,12 +854,12 @@ impl Module {
             ValueId::Global(GlobalValueId(idx)) => {
                 if let Some(variable) = self.globals.get(idx) {
                     if let Some(name) = &variable.name {
-                        write!(f, "%v_{}", name)?;
+                        write!(f, "%g_{}", name)?;
                     } else {
-                        write!(f, "%v{}", idx)?;
+                        write!(f, "%g{}", idx)?;
                     }
                 } else {
-                    write!(f, "%v{}", idx)?;
+                    write!(f, "%g{}", idx)?;
                 }
             }
             ValueId::Input(_, idx) => write!(f, "%i{}", idx)?,
@@ -734,31 +870,7 @@ impl Module {
 }
 
 fn format_tensor_type(tensor_type: &TensorType) -> String {
-    use crate::array::DType;
-
-    let dtype_str = match tensor_type.dtype {
-        DType::F32 => "f32",
-        DType::F64 => "f64",
-        DType::I32 => "i32",
-        DType::I64 => "i64",
-        DType::U32 => "u32",
-        DType::U64 => "u64",
-        DType::I16 => "i16",
-        DType::U16 => "u16",
-        DType::I8 => "i8",
-        DType::U8 => "u8",
-        DType::Bool => "bool",
-    };
-
-    // For now, we'll show the rank with unknown dimensions
-    let shape_str = if tensor_type.rank == 0 {
-        "[]".to_string()
-    } else {
-        let dims = vec!["?"; tensor_type.rank];
-        format!("[{}]", dims.join(", "))
-    };
-
-    format!("{}{}", dtype_str, shape_str)
+    tensor_type.to_string()
 }
 
 // Builder pattern implementation
@@ -914,6 +1026,7 @@ pub struct RegionBuilder {
     module_builder: Arc<Mutex<ModuleBuilder>>,
     nodes: Vec<NodeId>,
     function_builder: Option<FunctionBuilder>,
+    sequential: bool,
 }
 
 impl RegionBuilder {
@@ -925,6 +1038,7 @@ impl RegionBuilder {
             module_builder,
             nodes: Vec::new(),
             function_builder,
+            sequential: false,
         }
     }
 
@@ -949,7 +1063,10 @@ impl RegionBuilder {
     }
 
     pub fn finish(self) -> (Option<FunctionBuilder>, RegionId) {
-        let region = Region { nodes: self.nodes };
+        let region = Region {
+            nodes: self.nodes,
+            sequential: self.sequential,
+        };
 
         let mut builder = self.module_builder.lock().unwrap();
         let region_id = builder.add_region(region);
@@ -958,6 +1075,16 @@ impl RegionBuilder {
 
     pub fn create_subregion(&self) -> RegionBuilder {
         RegionBuilder::new(self.module_builder.clone(), None)
+    }
+
+    pub fn sequential(mut self) -> Self {
+        self.sequential = true;
+        self
+    }
+
+    pub fn parallel(mut self) -> Self {
+        self.sequential = false;
+        self
     }
 
     pub fn add_alloc(
@@ -1002,11 +1129,237 @@ impl RegionBuilder {
         let instruction = Instruction::while_(cond_region, body_region);
         self.add_node(instruction, vec![condition])
     }
+
+    pub fn add_block(&mut self, region: RegionId) -> NodeId {
+        let instruction = Instruction::block(region);
+        self.add_node(instruction, vec![])
+    }
 }
 
 impl Default for ModuleBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub trait ValueStore {
+    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value>;
+    // Might be a MutexGuard!
+    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value>;
+
+    fn set_input(&mut self, func_id: FunctionId, index: usize, value: Value);
+    fn set_output(&mut self, func_id: FunctionId, index: usize, value: Value);
+    fn set_global(&mut self, global_id: GlobalValueId, value: Value);
+
+    fn pop_input(&mut self, func_id: FunctionId, index: usize) -> Value {
+        let mut slot = self.resolve_value_mut(ValueId::Input(func_id, index));
+        std::mem::replace(&mut *slot, Value::Empty)
+    }
+
+    fn pop_output(&mut self, func_id: FunctionId, index: usize) -> Value {
+        let mut slot = self.resolve_value_mut(ValueId::Output(func_id, index));
+        std::mem::replace(&mut *slot, Value::Empty)
+    }
+
+    fn pop_global(&mut self, global_id: GlobalValueId) -> Value {
+        let mut slot = self.resolve_value_mut(ValueId::Global(global_id));
+        std::mem::replace(&mut *slot, Value::Empty)
+    }
+}
+
+#[derive(Debug)]
+struct RayonValue(RwLock<Value>);
+
+pub struct RayonValueStore {
+    globals: Vec<RayonValue>,
+    inputs: Vec<Vec<RayonValue>>,
+    outputs: Vec<Vec<RayonValue>>,
+}
+
+impl ValueStore for RayonValueStore {
+    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value> {
+        match value_id {
+            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.try_read().unwrap(),
+            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.try_read().unwrap(),
+            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.try_read().unwrap(),
+        }
+    }
+
+    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value> {
+        match value_id {
+            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.try_write().unwrap(),
+            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.try_write().unwrap(),
+            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.try_write().unwrap(),
+        }
+    }
+
+    fn set_input(&mut self, func_id: FunctionId, index: usize, value: Value) {
+        if func_id.0 >= self.inputs.len() {
+            self.inputs.resize_with(func_id.0 + 1, || Vec::new());
+        }
+        if index >= self.inputs[func_id.0].len() {
+            self.inputs[func_id.0].resize_with(index + 1, || RayonValue(RwLock::new(Value::Empty)));
+        }
+        let mut slot = self.inputs[func_id.0][index].0.write().unwrap();
+        *slot = value;
+    }
+
+    fn set_output(&mut self, func_id: FunctionId, index: usize, value: Value) {
+        if func_id.0 >= self.outputs.len() {
+            self.outputs.resize_with(func_id.0 + 1, || Vec::new());
+        }
+        if index >= self.outputs[func_id.0].len() {
+            self.outputs[func_id.0]
+                .resize_with(index + 1, || RayonValue(RwLock::new(Value::Empty)));
+        }
+        let mut slot = self.outputs[func_id.0][index].0.write().unwrap();
+        *slot = value;
+    }
+
+    fn set_global(&mut self, global_id: GlobalValueId, value: Value) {
+        let mut slot = self.globals[global_id.0].0.write().unwrap();
+        *slot = value;
+    }
+}
+
+pub trait ExecutionContext {
+    type ValueStore: ValueStore;
+
+    fn run_region(&self, region_id: RegionId, values: &Self::ValueStore) -> Result<()>;
+    fn run_region_seq(&self, region_id: RegionId, values: &Self::ValueStore) -> Result<()>;
+    fn numba_runtime(&self) -> &Arc<NumbaRuntime>;
+
+    fn create_values(&self) -> Self::ValueStore;
+    fn run(&self, func: FunctionId, values: &Self::ValueStore) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub struct RayonExecutionContext<'a> {
+    module: &'a Module,
+    // One per NodeId
+    missing_counts: Vec<CachePadded<AtomicUsize>>,
+    numba_runtime: Arc<NumbaRuntime>,
+}
+
+impl<'a> RayonExecutionContext<'a> {
+    pub fn new(module: &'a Module, numba_runtime: Arc<NumbaRuntime>) -> Self {
+        let missing_counts = (0..module.nodes.len())
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
+        Self {
+            module,
+            missing_counts,
+            numba_runtime,
+        }
+    }
+
+    fn resolve_missing_count(&self, node_id: NodeId) -> &AtomicUsize {
+        &self.missing_counts[node_id.0]
+    }
+}
+
+impl<'a> ExecutionContext for RayonExecutionContext<'a> {
+    type ValueStore = RayonValueStore;
+
+    fn run_region(&self, region_id: RegionId, values: &RayonValueStore) -> Result<()> {
+        let module = self.module;
+        let region = module.resolve_region(region_id);
+
+        // Check if region should be executed sequentially
+        if region.sequential {
+            return self.run_region_seq(region_id, values);
+        }
+
+        let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
+        region.nodes.iter().for_each(|&node_id| {
+            let node = module.resolve_node(node_id);
+            let missing_count = node.predecessors.len();
+            let missing_count_loc = self.resolve_missing_count(node_id);
+            // TODO check ordering
+            missing_count_loc.store(missing_count, std::sync::atomic::Ordering::Relaxed);
+            if missing_count == 0 {
+                ready_nodes.push(node_id);
+            }
+        });
+
+        fn run_node(
+            ctx: &RayonExecutionContext,
+            module: &Module,
+            values: &RayonValueStore,
+            node_id: NodeId,
+        ) -> Result<()> {
+            let node = module.resolve_node(node_id);
+            node.run(ctx, values)?;
+
+            // Notify successors
+            let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
+            for &succ_id in node.successors.iter() {
+                let succ_missing_count = ctx.resolve_missing_count(succ_id);
+                let prev_count =
+                    succ_missing_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                assert!(prev_count > 0);
+                if prev_count == 1 {
+                    // Now ready
+                    let node_id = succ_id;
+                    ready_nodes.push(node_id);
+                }
+            }
+
+            ready_nodes
+                .into_par_iter()
+                .try_for_each(|&node_id| run_node(ctx, module, values, node_id))?;
+            Ok(())
+        }
+
+        ready_nodes
+            .into_par_iter()
+            .try_for_each(|&node_id| run_node(self, module, values, node_id))?;
+        Ok(())
+    }
+
+    fn run_region_seq(&self, region_id: RegionId, values: &RayonValueStore) -> Result<()> {
+        let module = self.module;
+        let region = module.resolve_region(region_id);
+
+        // Sequential execution - just iterate through nodes in order
+        for &node_id in &region.nodes {
+            let node = module.resolve_node(node_id);
+            node.run(self, values)?;
+        }
+        Ok(())
+    }
+
+    fn numba_runtime(&self) -> &Arc<NumbaRuntime> {
+        &self.numba_runtime
+    }
+
+    fn create_values(&self) -> Self::ValueStore {
+        let module = self.module;
+        // Count the maximum global value ID used across all nodes
+        let mut max_global_id = 0;
+        for node in &module.nodes {
+            for &arg in &node.args {
+                if let ValueId::Global(GlobalValueId(id)) = arg {
+                    max_global_id = max_global_id.max(id + 1);
+                }
+            }
+        }
+
+        let mut globals = Vec::with_capacity(max_global_id);
+        for _ in 0..max_global_id {
+            globals.push(RayonValue(RwLock::new(Value::Empty)));
+        }
+
+        RayonValueStore {
+            globals,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    fn run(&self, function_id: FunctionId, values: &Self::ValueStore) -> Result<()> {
+        let entry = self.module.resolve_function(function_id).entry;
+        self.run_region(entry, values)
     }
 }
 
@@ -1027,9 +1380,9 @@ mod tests {
             builder.add_global_tensor(
                 Some("temp_array".to_string()),
                 TensorType {
-                    rank: 2,
                     dtype: DType::F32,
                     order: Order::RowMajor,
+                    shape: Some([None, None].as_slice().into()),
                 },
             )
         };
@@ -1039,9 +1392,9 @@ mod tests {
             builder.add_global_tensor(
                 Some("condition".to_string()),
                 TensorType {
-                    rank: 0,
                     dtype: DType::Bool,
                     order: Order::RowMajor,
+                    shape: Some([].as_slice().into()),
                 },
             )
         };
@@ -1054,26 +1407,26 @@ mod tests {
                 vec![
                     Variable::new(
                         ValueType::Tensor(TensorType {
-                            rank: 2,
                             dtype: DType::F32,
                             order: Order::RowMajor,
+                            shape: Some([None, None].as_slice().into()),
                         }),
                         None,
                     ),
                     Variable::new(
                         ValueType::Tensor(TensorType {
-                            rank: 1,
                             dtype: DType::I64,
                             order: Order::RowMajor,
+                            shape: Some([None].as_slice().into()),
                         }),
                         None,
                     ),
                 ],
                 vec![Variable::new(
                     ValueType::Tensor(TensorType {
-                        rank: 2,
                         dtype: DType::F32,
                         order: Order::RowMajor,
+                        shape: Some([None, None].as_slice().into()),
                     }),
                     None,
                 )],
@@ -1088,9 +1441,9 @@ mod tests {
             temp_array_id,
             function_builder.input(1).unwrap(), // shape input
             TensorType {
-                rank: 2,
                 dtype: DType::F32,
                 order: Order::RowMajor,
+                shape: Some([None, None].as_slice().into()),
             },
         );
 
@@ -1151,9 +1504,9 @@ mod tests {
             builder.add_global_tensor(
                 Some("input_data".to_string()),
                 TensorType {
-                    rank: 2,
                     dtype: DType::F32,
                     order: Order::RowMajor,
+                    shape: Some([None, None].as_slice().into()),
                 },
             )
         };
@@ -1163,9 +1516,9 @@ mod tests {
             builder.add_global_tensor(
                 Some("output_data".to_string()),
                 TensorType {
-                    rank: 2,
                     dtype: DType::F32,
                     order: Order::RowMajor,
+                    shape: Some([None, None].as_slice().into()),
                 },
             )
         };
@@ -1175,9 +1528,9 @@ mod tests {
             builder.add_global_tensor(
                 Some("should_transform".to_string()),
                 TensorType {
-                    rank: 0,
                     dtype: DType::Bool,
                     order: Order::RowMajor,
+                    shape: Some([].as_slice().into()),
                 },
             )
         };
@@ -1190,26 +1543,26 @@ mod tests {
                 vec![
                     Variable::new(
                         ValueType::Tensor(TensorType {
-                            rank: 2,
                             dtype: DType::F32,
                             order: Order::RowMajor,
+                            shape: Some([None, None].as_slice().into()),
                         }),
                         Some("input".to_string()),
                     ),
                     Variable::new(
                         ValueType::Tensor(TensorType {
-                            rank: 1,
                             dtype: DType::I64,
                             order: Order::RowMajor,
+                            shape: Some([None].as_slice().into()),
                         }),
                         Some("shape".to_string()),
                     ),
                 ],
                 vec![Variable::new(
                     ValueType::Tensor(TensorType {
-                        rank: 2,
                         dtype: DType::F32,
                         order: Order::RowMajor,
+                        shape: Some([None, None].as_slice().into()),
                     }),
                     Some("result".to_string()),
                 )],
@@ -1224,9 +1577,9 @@ mod tests {
             output_array_id,
             function_builder.input(1).unwrap(), // shape input
             TensorType {
-                rank: 2,
                 dtype: DType::F32,
                 order: Order::RowMajor,
+                shape: Some([None, None].as_slice().into()),
             },
         );
 
@@ -1297,14 +1650,14 @@ mod tests {
         );
 
         let tensor_type = TensorType {
-            rank: 2,
             dtype: DType::F32,
             order: Order::RowMajor,
+            shape: Some([None, None].as_slice().into()),
         };
 
         let temp_array_id = {
             let mut builder = module_builder.lock().unwrap();
-            builder.add_global_tensor(Some("temp_array".to_string()), tensor_type)
+            builder.add_global_tensor(Some("temp_array".to_string()), tensor_type.clone())
         };
 
         // Add an allocation instruction
@@ -1378,162 +1731,5 @@ mod tests {
         assert_eq!(module.num_functions(), 1);
         assert_eq!(module.num_variables(), 3); // input_data, output_data, should_transform
         assert!(module.num_regions() >= 3); // main + then + else branches
-    }
-}
-
-pub trait ValueStore {
-    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value>;
-    // Might be a MutexGuard!
-    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value>;
-}
-
-#[derive(Debug)]
-struct RayonValue(Arc<Mutex<Value>>);
-
-pub struct RayonValueStore {
-    globals: Vec<RayonValue>,
-    inputs: Vec<Vec<RayonValue>>,
-    outputs: Vec<Vec<RayonValue>>,
-}
-
-impl ValueStore for RayonValueStore {
-    fn resolve_value(&self, value_id: ValueId) -> impl Deref<Target = Value> {
-        match value_id {
-            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.lock().unwrap(),
-            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.lock().unwrap(),
-            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.lock().unwrap(),
-        }
-    }
-
-    fn resolve_value_mut(&self, value_id: ValueId) -> impl DerefMut<Target = Value> {
-        match value_id {
-            ValueId::Input(func_id, i) => self.inputs[func_id.0][i].0.lock().unwrap(),
-            ValueId::Output(func_id, i) => self.outputs[func_id.0][i].0.lock().unwrap(),
-            ValueId::Global(GlobalValueId(i)) => self.globals[i].0.lock().unwrap(),
-        }
-    }
-}
-
-pub trait ExecutionContext {
-    type ValueStore: ValueStore;
-
-    fn run_region(&self, region_id: RegionId, values: &Self::ValueStore) -> Result<()>;
-    fn numba_runtime(&self) -> &Arc<NumbaRuntime>;
-
-    fn create_values(&self) -> Self::ValueStore;
-    fn run(&self, func: FunctionId, values: &Self::ValueStore) -> Result<()>;
-}
-
-#[derive(Debug)]
-pub struct RayonExecutionContext<'a> {
-    module: &'a Module,
-    // One per NodeId
-    missing_counts: Vec<CachePadded<AtomicUsize>>,
-    numba_runtime: Arc<NumbaRuntime>,
-}
-
-impl<'a> RayonExecutionContext<'a> {
-    pub fn new(module: &'a Module, numba_runtime: Arc<NumbaRuntime>) -> Self {
-        let missing_counts = (0..module.nodes.len())
-            .map(|_| CachePadded::new(AtomicUsize::new(0)))
-            .collect();
-        Self {
-            module,
-            missing_counts,
-            numba_runtime,
-        }
-    }
-
-    fn resolve_missing_count(&self, node_id: NodeId) -> &AtomicUsize {
-        &self.missing_counts[node_id.0]
-    }
-}
-
-impl<'a> ExecutionContext for RayonExecutionContext<'a> {
-    type ValueStore = RayonValueStore;
-
-    fn run_region(&self, region_id: RegionId, values: &RayonValueStore) -> Result<()> {
-        let module = self.module;
-        let region = module.resolve_region(region_id);
-
-        let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
-        region.nodes.iter().for_each(|&node_id| {
-            let node = module.resolve_node(node_id);
-            let missing_count = node.predecessors.len();
-            let missing_count_loc = self.resolve_missing_count(node_id);
-            // TODO check ordering
-            missing_count_loc.store(missing_count, std::sync::atomic::Ordering::Relaxed);
-            if missing_count == 0 {
-                ready_nodes.push(node_id);
-            }
-        });
-
-        fn run_node(
-            ctx: &RayonExecutionContext,
-            module: &Module,
-            values: &RayonValueStore,
-            node_id: NodeId,
-        ) -> Result<()> {
-            let node = module.resolve_node(node_id);
-            node.run(ctx, values)?;
-
-            // Notify successors
-            let mut ready_nodes: SmallVec<[NodeId; 16]> = SmallVec::new();
-            for &succ_id in node.successors.iter() {
-                let succ_missing_count = ctx.resolve_missing_count(succ_id);
-                let prev_count =
-                    succ_missing_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                assert!(prev_count > 0);
-                if prev_count == 1 {
-                    // Now ready
-                    let node_id = succ_id;
-                    ready_nodes.push(node_id);
-                }
-            }
-
-            // Run ready nodes
-            ready_nodes
-                .into_par_iter()
-                .try_for_each(|&node_id| run_node(ctx, module, values, node_id))?;
-            Ok(())
-        }
-
-        ready_nodes
-            .into_par_iter()
-            .try_for_each(|&node_id| run_node(self, module, values, node_id))?;
-        Ok(())
-    }
-
-    fn numba_runtime(&self) -> &Arc<NumbaRuntime> {
-        &self.numba_runtime
-    }
-
-    fn create_values(&self) -> Self::ValueStore {
-        let module = self.module;
-        // Count the maximum global value ID used across all nodes
-        let mut max_global_id = 0;
-        for node in &module.nodes {
-            for &arg in &node.args {
-                if let ValueId::Global(GlobalValueId(id)) = arg {
-                    max_global_id = max_global_id.max(id + 1);
-                }
-            }
-        }
-
-        let mut globals = Vec::with_capacity(max_global_id);
-        for _ in 0..max_global_id {
-            globals.push(RayonValue(Arc::new(Mutex::new(Value::Empty))));
-        }
-
-        RayonValueStore {
-            globals,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        }
-    }
-
-    fn run(&self, function_id: FunctionId, values: &Self::ValueStore) -> Result<()> {
-        let entry = self.module.resolve_function(function_id).entry;
-        self.run_region(entry, values)
     }
 }
