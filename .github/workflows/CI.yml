@@ -11,7 +11,7 @@ on:
       - main
       - master
     tags:
-      - '*'
+      - "*"
   pull_request:
   workflow_dispatch:
 
@@ -19,6 +19,22 @@ permissions:
   contents: read
 
 jobs:
+  linux-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+      - name: Install maturin
+        run: pip install maturin
+      - name: rust tests
+        run: cargo test
+      - name: build python package
+        run: maturin develop --release --find-interpreter
+      - name: python tests
+        run: pytest tests
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -170,7 +186,7 @@ jobs:
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'wheels-*/*'
+          subject-path: "wheels-*/*"
       - name: Publish to PyPI
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: PyO3/maturin-action@v1
