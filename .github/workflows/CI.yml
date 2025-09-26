@@ -31,7 +31,7 @@ jobs:
       - name: rust tests
         run: cargo test
       - name: build python package
-        run: maturin develop --release --find-interpreter
+        run: maturin develop
       - name: python tests
         run: pytest tests
 

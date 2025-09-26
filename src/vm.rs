@@ -1363,6 +1363,7 @@ impl<'a> ExecutionContext for RayonExecutionContext<'a> {
     }
 }
 
+// TODO: These are mostly AI generated, and don't make that much sense
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1729,7 +1730,7 @@ mod tests {
 
         // Verify structure
         assert_eq!(module.num_functions(), 1);
-        assert_eq!(module.num_variables(), 3); // input_data, output_data, should_transform
-        assert!(module.num_regions() >= 3); // main + then + else branches
+        assert_eq!(module.num_variables(), 4); // input_data, output_data, should_transform
+        assert_eq!(module.num_regions(), 3); // main + then + else branches
     }
 }

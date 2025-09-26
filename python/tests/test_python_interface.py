@@ -1,5 +1,5 @@
 import pytest
-import pytensor_rt._lib as lib
+import tensorvm._lib as lib
 
 
 def test_create_function_builder():

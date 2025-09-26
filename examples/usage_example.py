@@ -11,23 +11,23 @@ Some parts may not run until the full integration is complete.
 
 import numba
 import numpy as np
-import pytensor_rt
-from pytensor_rt import pytensor_rt as lib
+import tensorvm
+from tensorvm import _lib as lib
 
-nrt = pytensor_rt.numba_ffi.get_nrt_api()
+nrt = tensorvm.numba_ffi.get_nrt_api()
 
 
 @numba.jit(no_cpython_wrapper=True, nopython=True, fastmath=True)
 def func(bundle):
-    x = pytensor_rt.numba_ffi.view_from_bundle(bundle, 0, np.float64, 2)
-    y = pytensor_rt.numba_ffi.view_from_bundle(bundle, 1, np.float64, 2)
-    #y = pytensor_rt.numba_ffi.ensure_array_from_bundle(bundle, 1, x.shape, np.float64, 2)
+    x = tensorvm.numba_ffi.view_from_bundle(bundle, 0, np.float64, 2)
+    y = tensorvm.numba_ffi.view_from_bundle(bundle, 1, np.float64, 2)
+    # y = pytensor_rt.numba_ffi.ensure_array_from_bundle(bundle, 1, x.shape, np.float64, 2)
 
-    #assert x.strides[-1] == 8
-    #assert y.strides[-1] == 8
-    #x = np.ascontiguousarray(x)
-    #y = np.ascontiguousarray(y)
-    #y[...] = (2 * x) * (2 * x)
+    # assert x.strides[-1] == 8
+    # assert y.strides[-1] == 8
+    # x = np.ascontiguousarray(x)
+    # y = np.ascontiguousarray(y)
+    # y[...] = (2 * x) * (2 * x)
 
     n, m = x.shape
     assert x.shape == y.shape
@@ -38,7 +38,8 @@ def func(bundle):
 
     return 0
 
-mul = pytensor_rt.numba_ffi.wrap_inplace_njit_function(func)
+
+mul = tensorvm.numba_ffi.wrap_inplace_njit_function(func)
 builder = lib.VMBuilder()
 
 z = np.random.randn(10, 10)
